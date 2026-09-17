@@ -1,0 +1,7 @@
+# tomcat
+server:
+  port: 8000
+# spring
+spring:
+  application:
+    name: webchat-server
