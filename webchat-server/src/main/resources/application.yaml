@@ -5,3 +5,14 @@ server:
 spring:
   application:
     name: webchat-server
+  datasource:
+    username: root
+    password: webchat123
+    url: jdbc:mysql://192.168.150.101:3306/webchat?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    driver-class-name: com.mysql.cj.jdbc.Driver
+langchain4j:
+  community:
+    dashscope:
+      chat-model:
+        api-key: ${QWEN_API_KEY}
+        model-name: qwen3.8-max
