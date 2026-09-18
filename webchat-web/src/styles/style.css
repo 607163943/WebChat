@@ -1,0 +1,271 @@
+/* 注意：shadcn-vue CLI 每次 add 组件都会往这里塞一个 Google Fonts 的 @import，
+   本项目刻意不用——国内访问不通会拖慢首屏，字体改走系统栈（见下方 --font-sans）。 */
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  /* 设计稿用 Noto Sans SC / JetBrains Mono。刻意不引 Google Fonts——国内网络常访问不通，
+     会静默退化成 fallback；改为系统字体栈，优先命中本机已装的 Noto Sans SC */
+  --font-sans:
+    'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', SFMono-Regular, Consolas, monospace;
+  --font-heading: var(--font-sans);
+
+  /* 设计稿额外的四个令牌（不在 shadcn 标准集里） */
+  --color-sidebar-bg: var(--sidebar-bg);
+  --color-fg-secondary: var(--fg-secondary);
+  --color-subtle-fg: var(--subtle-fg);
+  --color-muted-active: var(--muted-active);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* 亮色令牌取自 design/webchat.pen——即 shadcn 的 zinc 色阶（原先这里是 neutral，与设计稿有肉眼可辨的色差） */
+:root {
+  --radius: 0.625rem;
+  --background: #ffffff;
+  --foreground: #09090b;
+  --card: #ffffff;
+  --card-foreground: #09090b;
+  --popover: #ffffff;
+  --popover-foreground: #09090b;
+  --primary: #18181b;
+  --primary-foreground: #fafafa;
+  --secondary: #f4f4f5;
+  --secondary-foreground: #18181b;
+  --muted: #f4f4f5;
+  --muted-foreground: #71717a;
+  --accent: #f4f4f5;
+  --accent-foreground: #18181b;
+  --destructive: #dc2626;
+  --border: #e4e4e7;
+  --input: #e4e4e7;
+  --ring: #a1a1aa;
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: #fafafa;
+  --sidebar-foreground: #09090b;
+  --sidebar-primary: #18181b;
+  --sidebar-primary-foreground: #fafafa;
+  --sidebar-accent: #f4f4f5;
+  --sidebar-accent-foreground: #18181b;
+  --sidebar-border: #e4e4e7;
+  --sidebar-ring: #a1a1aa;
+
+  /* 设计稿里这几项不属于 shadcn 标准令牌，单独列出 */
+  --sidebar-bg: #fafafa;
+  --fg-secondary: #3f3f46;
+  --subtle-fg: #a1a1aa;
+  --muted-active: #eeeeef;
+}
+
+/* 设计稿只有亮色一套，这里为将来可能的暗色模式预留，值按 zinc 暗色阶推导 */
+.dark {
+  --background: #09090b;
+  --foreground: #fafafa;
+  --card: #18181b;
+  --card-foreground: #fafafa;
+  --popover: #18181b;
+  --popover-foreground: #fafafa;
+  --primary: #fafafa;
+  --primary-foreground: #18181b;
+  --secondary: #27272a;
+  --secondary-foreground: #fafafa;
+  --muted: #27272a;
+  --muted-foreground: #a1a1aa;
+  --accent: #27272a;
+  --accent-foreground: #fafafa;
+  --destructive: #ef4444;
+  --border: rgb(255 255 255 / 10%);
+  --input: rgb(255 255 255 / 15%);
+  --ring: #71717a;
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: #18181b;
+  --sidebar-foreground: #fafafa;
+  --sidebar-primary: #4880ee;
+  --sidebar-primary-foreground: #fafafa;
+  --sidebar-accent: #27272a;
+  --sidebar-accent-foreground: #fafafa;
+  --sidebar-border: rgb(255 255 255 / 10%);
+  --sidebar-ring: #71717a;
+
+  --sidebar-bg: #18181b;
+  --fg-secondary: #a1a1aa;
+  --subtle-fg: #71717a;
+  --muted-active: #27272a;
+}
+
+/* 打字指示器：三个圆点依次轻微上浮，比 Tailwind 自带的 animate-bounce 幅度小得多 */
+@keyframes typing-dot {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+}
+
+/* Markdown 正文排版。Tailwind 的 preflight 清空了浏览器默认样式，这里逐项补回来 */
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p {
+  margin: 0 0 0.75em;
+}
+.markdown-body p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  @apply text-foreground font-semibold;
+  margin: 1.25em 0 0.5em;
+  line-height: 1.4;
+}
+.markdown-body h1 {
+  font-size: 1.25em;
+}
+.markdown-body h2 {
+  font-size: 1.15em;
+}
+.markdown-body h3,
+.markdown-body h4 {
+  font-size: 1.05em;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0 0 0.75em;
+  padding-left: 1.4em;
+}
+.markdown-body ul {
+  list-style: disc;
+}
+.markdown-body ol {
+  list-style: decimal;
+}
+.markdown-body li {
+  margin: 0.2em 0;
+}
+.markdown-body li::marker {
+  color: var(--subtle-fg);
+}
+
+.markdown-body code {
+  @apply bg-muted text-fg-secondary rounded font-mono;
+  padding: 0.15em 0.35em;
+  font-size: 0.875em;
+}
+
+.markdown-body pre {
+  @apply border-border bg-sidebar-bg my-3 overflow-x-auto rounded-lg border;
+  padding: 12px 14px;
+}
+.markdown-body pre code {
+  background: transparent;
+  border-radius: 0;
+  padding: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* Shiki 会把主题背景色写进 <pre> 的内联 style，这里让容器样式说了算 */
+.markdown-body .shiki {
+  background-color: transparent !important;
+}
+.markdown-body .shiki code {
+  display: block;
+}
+
+.markdown-body blockquote {
+  @apply border-border text-muted-foreground my-3 border-l-2 pl-3;
+}
+
+.markdown-body a {
+  @apply underline underline-offset-2;
+}
+
+.markdown-body table {
+  @apply my-3 w-full border-collapse text-[13px];
+}
+.markdown-body th,
+.markdown-body td {
+  @apply border-border border px-2 py-1 text-left;
+}
+.markdown-body th {
+  @apply bg-muted font-medium;
+}
+
+.markdown-body hr {
+  @apply border-border my-4 border-t;
+}
+
+.markdown-body img {
+  @apply max-w-full rounded-md;
+}

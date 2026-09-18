@@ -5,10 +5,16 @@ server:
 spring:
   application:
     name: webchat-server
+  # 本地敏感配置（QWEN_API_KEY）写在已 gitignore 的 .env 里，Spring Boot 不会自动读，需显式导入
+  config:
+    import: optional:file:./.env[.properties]
   datasource:
     username: root
     password: webchat123
-    url: jdbc:mysql://192.168.150.101:3306/webchat?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    # 容器本身跑在 UTC（docker exec webchat-mysql date → UTC），若只写 serverTimezone 只影响驱动解读、
+    # 不会改服务端会话时区，create_time/update_time 会按 UTC 落库，比本地时间少 8 小时。
+    # forceConnectionTimeZoneToSession 让驱动在连接时执行 SET SESSION time_zone，使 NOW() 与数据库默认值走北京时间。
+    url: jdbc:mysql://192.168.150.101:3306/webchat?useUnicode=true&characterEncoding=utf-8&connectionTimeZone=Asia/Shanghai&forceConnectionTimeZoneToSession=true
     driver-class-name: com.mysql.cj.jdbc.Driver
 langchain4j:
   community:
@@ -16,3 +22,11 @@ langchain4j:
       chat-model:
         api-key: ${QWEN_API_KEY}
         model-name: qwen3.8-max
+      # 流式模型是独立的配置前缀，不配这段就不会有 StreamingChatModel bean
+      streaming-chat-model:
+        api-key: ${QWEN_API_KEY}
+        model-name: qwen3.8-max
+# springdoc：让导出的 openapi.json 逐字节稳定，否则每次重新生成 git diff 都是噪音
+springdoc:
+  writer-with-order-by-keys: true
+  writer-with-default-pretty-printer: true

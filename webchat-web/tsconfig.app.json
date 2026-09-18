@@ -5,8 +5,8 @@
   "compilerOptions": {
     // Extra safety for array and object lookups, but may have false positives.
     "noUncheckedIndexedAccess": true,
-
     // Path mapping for cleaner imports.
+    // 不写 baseUrl：它在 TypeScript 6 已废弃；自 TS 4.4 起 paths 就相对本文件解析。
     "paths": {
       "@/*": ["./src/*"]
     },

@@ -1,0 +1,11 @@
+# 仅供 OpenApiExportTests 使用：导出 openapi.json 只需要上下文能启动，
+# 既不必连数据库，也不该依赖 .env 里的真实 API Key，所以把两个模型前缀都置成占位值。
+#
+# 数据源刻意不改：Hikari 是懒连接，导出接口不碰库，因此不需要为了这个测试引入 H2。
+langchain4j:
+  community:
+    dashscope:
+      chat-model:
+        api-key: apidocs-dummy
+      streaming-chat-model:
+        api-key: apidocs-dummy

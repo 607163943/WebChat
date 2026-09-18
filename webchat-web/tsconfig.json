@@ -7,5 +7,11 @@
     {
       "path": "./tsconfig.app.json"
     }
-  ]
+  ],
+  "compilerOptions": {
+    // 同上：baseUrl 在 TypeScript 6 已废弃，paths 相对本文件解析即可
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
 }

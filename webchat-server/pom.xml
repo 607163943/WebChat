@@ -82,6 +82,18 @@
 			<artifactId>langchain4j-community-dashscope-spring-boot-starter</artifactId>
 			<version>1.20.0-beta30</version>
 		</dependency>
+		<!--Reactor：SSE 接口返回 Flux 需要，spring-boot-starter-web 不带它，
+		    目前仅由 langchain4j-reactor 传递引入，显式声明以免日后清理依赖时运行时炸-->
+		<dependency>
+			<groupId>io.projectreactor</groupId>
+			<artifactId>reactor-core</artifactId>
+		</dependency>
+		<!--springdoc：接口契约由注解生成 openapi.json，版本锁 2.9.x（3.x 面向 Spring Boot 4，不可用）-->
+		<dependency>
+			<groupId>org.springdoc</groupId>
+			<artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+			<version>2.9.1</version>
+		</dependency>
 	</dependencies>
 
 	<build>
