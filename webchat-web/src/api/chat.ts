@@ -11,8 +11,12 @@ export interface ChatStreamHandlers {
   onDelta: (content: string) => void
   /** 生成结束，messageId 是落库后的助手消息 ID */
   onDone: (messageId: number) => void
-  /** 新会话首条消息生成标题后的一次性事件 */
-  onTitle: (title: string) => void
+  /**
+   * 新会话首条消息生成标题后的一次性事件。
+   *
+   * @param conversationId 这条标题属于哪个会话。事件自带主语，调用方不用拿「当前会话」去猜
+   */
+  onTitle: (title: string, conversationId: number) => void
   /**
    * 生成失败，或连接层面的失败。
    *
@@ -60,7 +64,7 @@ async function streamChat(
             handlers.onDone(numberField(data, 'messageId'))
             break
           case 'title':
-            handlers.onTitle(textField(data, 'title'))
+            handlers.onTitle(textField(data, 'title'), numberField(data, 'conversationId'))
             break
           case 'error':
             // 能收到 error 事件说明流已经建立，后端也已落过用户消息

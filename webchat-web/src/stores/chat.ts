@@ -65,10 +65,6 @@ export const useChatStore = defineStore('chat', () => {
 
   async function initialize(): Promise<void> {
     await loadConversations()
-    const first = conversations.value[0]
-    if (first) {
-      await openConversation(first.id)
-    }
   }
 
   async function loadConversations(): Promise<void> {
@@ -99,12 +95,24 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function startConversation(): Promise<void> {
+  /**
+   * 开一个新对话：只把界面切到空白，**不建后端会话**。
+   *
+   * 会话在用户发出首条消息时才落库（见 send），所以点一下「新建对话」再刷新页面，
+   * 库里不会多出一条点开是空的会话。做法是把 currentId 置空——null 就是这个
+   * 「已开好、还没落库」的草稿态，send 里本来就有「没有会话就先建一个」的分支。
+   */
+  function startConversation(): void {
     abortStream()
-    await ensureConversation()
+    currentId.value = null
+    messages.value = []
   }
 
-  /** 确保有一个可用的会话，返回其 id；创建失败返回 null */
+  /**
+   * 确保有一个可用的会话，返回其 id；创建失败返回 null。
+   *
+   * 这是会话落库的唯一入口，调用点只有 send：会话行和它的首条消息是同一次点击产生的。
+   */
   async function ensureConversation(): Promise<number | null> {
     try {
       const created = await createConversationApi()
@@ -118,6 +126,28 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  /**
+   * 撤掉一个刚建出来、消息却没发出去的会话。
+   *
+   * 会话行是为了发那条消息才插的，消息既然没落库就不该留它，否则刷新后侧边栏会多出一条
+   * 点开是空的会话。
+   *
+   * 与 removeConversation 的分工：这里是静默回滚，不报错、也不自动切到别的会话——
+   * 撤完要回到草稿态，好让用户重发时重新建一个。
+   */
+  async function discardConversation(id: number): Promise<void> {
+    try {
+      await deleteConversationApi(id)
+      conversations.value = conversations.value.filter((item) => item.id !== id)
+      if (currentId.value === id) {
+        currentId.value = null
+      }
+    } catch {
+      // 删不掉就让它留着：本地列表刚按服务端刷新过，下次打开还看得到它，
+      // 不值得为掩盖一条空会话再造一层状态
+    }
+  }
+
   async function removeConversation(id: number): Promise<void> {
     try {
       await deleteConversationApi(id)
@@ -125,28 +155,31 @@ export const useChatStore = defineStore('chat', () => {
       if (currentId.value !== id) {
         return
       }
-      // 删掉的是当前会话，自动切到剩余的第一个
-      const next = conversations.value[0]
-      if (next) {
-        currentId.value = null
-        await openConversation(next.id)
-      } else {
-        currentId.value = null
-        messages.value = []
-      }
+      // 删掉的正是当前会话，本轮生成随之作废，必须先断流：否则它会照常跑完，
+      // done 把回复塞进已被清空的 messages，后端还会往一个已删除的会话里写消息。
+      abortStream()
+      // 自动回到新会话的草稿态，方便用户继续提问
+      currentId.value = null
+      messages.value = []
     } catch (error) {
       errorMessage.value = messageOf(error)
     }
   }
 
+  /**
+   * 发送输入框里的内容。
+   *
+   * 会话落库的唯一时机就在这里：没有会话就先建一个再发，所以「开好新对话但一直没发消息」
+   * 不会在库里留下任何东西（见 startConversation）。
+   */
   async function send(): Promise<void> {
     const text = draft.value.trim()
     if (!text || streaming.value) {
       return
     }
-    // 还没有会话时直接开一个，省掉「先点新建再发消息」这一步
     let id = currentId.value
-    if (id === null) {
+    const createdNow = id === null
+    if (createdNow) {
       id = await ensureConversation()
     }
     if (id === null) {
@@ -157,7 +190,14 @@ export const useChatStore = defineStore('chat', () => {
     draft.value = ''
     // 后端在收到消息时就会落库，本地先乐观插入，省掉一次往返
     messages.value.push(localMessage('user', text))
-    await runStream((handlers) => sendMessageApi(conversationId, text, handlers), text)
+    const accepted = await runStream(
+      (handlers, signal) => sendMessageApi(conversationId, text, handlers, signal),
+      text,
+    )
+    if (createdNow && !accepted) {
+      // 消息没发出去，这个会话就是白建的，一并撤掉（乐观插入的那条消息已由 runStream 撤回）
+      await discardConversation(conversationId)
+    }
   }
 
   async function regenerateLast(): Promise<void> {
@@ -170,53 +210,68 @@ export const useChatStore = defineStore('chat', () => {
     if (last?.role === 'assistant') {
       messages.value.pop()
     }
-    await runStream((handlers) => regenerateApi(conversationId, handlers))
+    await runStream((handlers, signal) => regenerateApi(conversationId, handlers, signal))
   }
 
   function clearError(): void {
     errorMessage.value = ''
   }
 
+  /**
+   * 跑一轮流式请求。
+   *
+   * @returns 请求是否被后端收下。false 表示它压根没到后端，本轮服务端不留任何数据，
+   *   调用方据此决定要不要把为这次发送而新建的会话也撤掉。
+   */
   async function runStream(
-    start: (handlers: ChatStreamHandlers) => Promise<void>,
+    start: (handlers: ChatStreamHandlers, signal: AbortSignal) => Promise<void>,
     sentText: string | null = null,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const controller = new AbortController()
     abortController = controller
     streaming.value = true
     streamingText.value = ''
     errorMessage.value = ''
     let failed = false
-    /** 后端是否已经接受了这次请求（接受了就意味着用户消息已落库） */
-    let requestAccepted = false
+    /**
+     * 请求是否被后端收下（收下了就意味着用户消息已落库）。
+     *
+     * 只有「压根没到后端」的失败才置为 false；成功与主动停止都算收下——停止是客户端
+     * 单方面断开，请求早就发出去了，用户消息同样在库里。
+     */
+    let accepted = true
 
     try {
-      await start({
-        onDelta: (chunk) => {
-          streamingText.value += chunk
+      await start(
+        {
+          onDelta: (chunk) => {
+            streamingText.value += chunk
+          },
+          onDone: (messageId) => {
+            messages.value.push({
+              id: messageId,
+              role: 'assistant',
+              content: streamingText.value,
+              createTime: new Date().toISOString(),
+            })
+            streamingText.value = ''
+          },
+          onTitle: (title, conversationId) => {
+            // 立即更新侧边栏；随后那次列表刷新会再对齐一次权威值。
+            // 按事件给的会话 id 定位，而不是 currentId——事件讲的是哪个会话就改哪一行
+            const target = conversations.value.find((item) => item.id === conversationId)
+            if (target) {
+              target.title = title
+            }
+          },
+          onError: (message, streamStarted) => {
+            failed = true
+            accepted = streamStarted
+            errorMessage.value = message
+          },
         },
-        onDone: (messageId) => {
-          messages.value.push({
-            id: messageId,
-            role: 'assistant',
-            content: streamingText.value,
-            createTime: new Date().toISOString(),
-          })
-          streamingText.value = ''
-        },
-        onTitle: (title) => {
-          // 立即更新侧边栏；随后那次列表刷新会再对齐一次权威值
-          const target = conversations.value.find((item) => item.id === currentId.value)
-          if (target) {
-            target.title = title
-          }
-        },
-        onError: (message, streamStarted) => {
-          failed = true
-          requestAccepted = streamStarted
-          errorMessage.value = message
-        },
-      })
+        controller.signal,
+      )
     } finally {
       streaming.value = false
       // 失败时丢弃半截内容——后端同样不会落库，留着会让刷新后前后不一致
@@ -228,7 +283,7 @@ export const useChatStore = defineStore('chat', () => {
       // 仅限「发送消息」这条路径：手动停止不算失败（用户消息已发出，还回去会造成重复提问），
       // regenerate 也没有输入框内容可还。
       if (failed && sentText !== null) {
-        if (!requestAccepted) {
+        if (!accepted) {
           // 请求压根没到后端，刚才乐观插入的那条用户消息并不存在，必须撤掉，
           // 否则用户拿着还原出来的内容重发一次，界面上就会出现两条一样的提问
           const last = messages.value[messages.value.length - 1]
@@ -243,6 +298,7 @@ export const useChatStore = defineStore('chat', () => {
       }
       await refreshConversations()
     }
+    return accepted
   }
 
   /**
