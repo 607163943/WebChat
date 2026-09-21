@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { ArrowUp, Square } from '@lucide/vue'
+import { ArrowUp, Plus, Square } from '@lucide/vue'
 
 const props = defineProps<{ streaming: boolean }>()
 
@@ -62,14 +62,21 @@ function onKeydown(event: KeyboardEvent): void {
 </script>
 
 <template>
-  <div
-    class="pointer-events-none absolute inset-x-0 bottom-0 flex flex-col items-center gap-3.5 px-4 pb-[18px]"
-  >
-    <!-- 输入胶囊。设计稿左侧还有一个「+」按钮，但当前没有附件类需求，
-         不铺无功能的入口，故先略去 -->
+  <!-- 定位（贴底 / 空状态上浮）交给 ChatView 的锚点，这里只负责这一组内容 -->
+  <div class="flex w-full flex-col items-center gap-3.5">
     <div
       class="bg-background border-border pointer-events-auto flex w-full max-w-[720px] items-center gap-2 rounded-[26px] border px-2.5 shadow-[0_2px_8px_rgba(0,0,0,0.08)]"
     >
+      <!-- 设计稿有这一颗，但附件功能还没做，所以它点是没反应的，
+           title 里如实说明，别让它看起来像能用 -->
+      <button
+        type="button"
+        class="bg-muted text-fg-secondary hover:bg-muted-active flex size-8 shrink-0 items-center justify-center rounded-full transition-colors"
+        title="添加附件（暂未开放）"
+      >
+        <Plus class="size-4" />
+      </button>
+
       <textarea
         ref="textarea"
         v-model="draft"

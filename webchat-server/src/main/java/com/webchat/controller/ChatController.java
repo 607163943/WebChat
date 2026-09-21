@@ -51,7 +51,8 @@ public class ChatController {
     }
 
     private Flux<ServerSentEvent<Object>> toSseStream(ChatContext context) {
-        return chatStreamService.stream(context).map(ChatController::toServerSentEvent);
+        return chatStreamService.stream(context)
+                .map(event -> toServerSentEvent(event, context.conversationId()));
     }
 
     /**
@@ -59,8 +60,10 @@ public class ChatController {
      *
      * <p>前端所用客户端在 {@code event:} 字段缺失时会把事件类型置为<b>空字符串</b>
      * （而不是 SSE 规范里的 {@code "message"}），只写 data 会让前端分不出 delta 与 done。
+     *
+     * @param conversationId 本轮事件所属的会话，在需要前端定位某一行时随事件下发
      */
-    private static ServerSentEvent<Object> toServerSentEvent(ChatEvent event) {
+    private static ServerSentEvent<Object> toServerSentEvent(ChatEvent event, Long conversationId) {
         return switch (event) {
             case ChatEvent.Delta delta -> ServerSentEvent.builder()
                     .event("delta")
@@ -72,7 +75,7 @@ public class ChatController {
                     .build();
             case ChatEvent.Title title -> ServerSentEvent.builder()
                     .event("title")
-                    .data(new TitlePayload(title.title()))
+                    .data(new TitlePayload(conversationId, title.title()))
                     .build();
             case ChatEvent.Failed failed -> ServerSentEvent.builder()
                     .event("error")
@@ -87,7 +90,8 @@ public class ChatController {
     record DonePayload(Long messageId) {
     }
 
-    record TitlePayload(String title) {
+    /** 标题事件自带会话 id：前端据此定位要改的那一行，不必去问「当前打开的是哪个会话」 */
+    record TitlePayload(Long conversationId, String title) {
     }
 
     record ErrorPayload(String message) {
