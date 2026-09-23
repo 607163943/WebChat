@@ -8,6 +8,13 @@ spring:
   # 本地敏感配置（QWEN_API_KEY）写在已 gitignore 的 .env 里，Spring Boot 不会自动读，需显式导入
   config:
     import: optional:file:./.env[.properties]
+  # 不配这段的话默认只有 1MB / 10MB：任何超过 1MB 的文件在参数解析阶段就抛
+  # MaxUploadSizeExceededException，根本进不到 AttachmentService 的校验代码里
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      # 一次请求只带一个文件（选出多个时逐个上传、各自拿一个附件 id），留足边界与表单字段的余量
+      max-request-size: 16MB
   datasource:
     username: root
     password: webchat123
@@ -26,6 +33,20 @@ langchain4j:
       streaming-chat-model:
         api-key: ${QWEN_API_KEY}
         model-name: qwen3.8-max
+# 附件：本地磁盘存储 + 多模态输入的相关上限。绑定与初始化见 config/AttachmentProperties
+webchat:
+  attachment:
+    # 相对路径按后端进程的工作目录解析
+    dir: ./data/attachments
+    max-file-size: 10MB
+    max-files-per-message: 5
+    # 整轮请求发给模型的媒体总量（base64 编码前）。只限个数不够：5 个 10MB 的文件编码后是 ~67MB
+    max-request-media-size: 20MB
+    # 未绑定附件的存活时长；调试清理任务时可临时改成 0s，那时未绑定的附件立刻成为候选
+    unbound-ttl: 24h
+    # 清理任务的扫描间隔，同时用作首次执行的延迟（@Scheduled 接受 30m 这种简单写法）
+    cleanup-interval: 30m
+    retry-alert-threshold: 5
 # springdoc：让导出的 openapi.json 逐字节稳定，否则每次重新生成 git diff 都是噪音
 springdoc:
   writer-with-order-by-keys: true

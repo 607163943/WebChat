@@ -4,18 +4,21 @@ import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.CurrentUserProvider;
+import com.webchat.dto.AttachmentVO;
 import com.webchat.dto.ConversationVO;
 import com.webchat.dto.MessageVO;
 import com.webchat.entity.Conversation;
 import com.webchat.entity.Message;
 import com.webchat.mapper.ConversationMapper;
 import com.webchat.mapper.MessageMapper;
+import com.webchat.service.AttachmentService;
 import com.webchat.service.ConversationService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -23,6 +26,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     private final ConversationMapper conversationMapper;
     private final MessageMapper messageMapper;
+    private final AttachmentService attachmentService;
     private final CurrentUserProvider currentUserProvider;
 
     @Override
@@ -73,8 +77,13 @@ public class ConversationServiceImpl implements ConversationService {
                 Wrappers.<Message>lambdaQuery()
                         .eq(Message::getConversationId, id)
                         .orderByAsc(Message::getId));
+        // 一次批量查回全部附件再按 message_id 分组，避免每条消息查一次。
+        // 少了这一步，「只发附件不打字」的消息重新拉取时就只剩一个带内边距的空气泡
+        Map<Long, List<AttachmentVO>> attachments = attachmentService.listByMessageIds(
+                rows.stream().map(Message::getId).toList());
         return rows.stream()
-                .map(m -> new MessageVO(m.getId(), m.getRole(), m.getContent(), m.getCreateTime()))
+                .map(m -> new MessageVO(m.getId(), m.getRole(), m.getContent(), m.getCreateTime(),
+                        attachments.getOrDefault(m.getId(), List.of())))
                 .toList();
     }
 

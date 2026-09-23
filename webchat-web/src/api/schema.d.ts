@@ -4,6 +4,70 @@
  */
 
 export interface paths {
+    "/api/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 上传附件
+         * @description 图片或视频，单文件上限与允许的类型见 webchat.attachment 配置与 AttachmentTypePolicy。
+         *     上传即落库并返回可回显的 url，此时 message_id 为空（待绑定），随发送消息时提交 id 完成绑定。
+         *     conversationId 可选：新对话草稿态还没有会话，留空即可。
+         */
+        post: operations["upload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/attachments/content/{objectKey}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 读取附件内容
+         * @description 按存储键读取原始字节，用于前端回显。
+         *     用对象键而不是自增 id 是有意的：id 连续可枚举，而当前登录功能未开发、user_id 恒为 1，
+         *     归属校验对任何请求都成立——把 id 当边界等于没有边界。
+         */
+        get: operations["content"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/attachments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 删除附件
+         * @description 只允许删还没随消息发出的附件；幂等，已经没了也不报错
+         */
+        delete: operations["delete_1"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations": {
         parameters: {
             query?: never;
@@ -99,6 +163,15 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AttachmentVO: {
+            /** Format: int64 */
+            fileSize?: number;
+            /** Format: int64 */
+            id?: number;
+            mimeType?: string;
+            originalName?: string;
+            url?: string;
+        };
         ConversationVO: {
             /** Format: int64 */
             id?: number;
@@ -107,12 +180,19 @@ export interface components {
             updateTime?: string;
         };
         MessageVO: {
+            attachments?: components["schemas"]["AttachmentVO"][];
             content?: string;
             /** Format: date-time */
             createTime?: string;
             /** Format: int64 */
             id?: number;
             role?: string;
+        };
+        ResultAttachmentVO: {
+            /** Format: int32 */
+            code?: number;
+            data?: components["schemas"]["AttachmentVO"];
+            message?: string;
         };
         ResultConversationVO: {
             /** Format: int32 */
@@ -139,6 +219,7 @@ export interface components {
             message?: string;
         };
         SendMessageRequest: {
+            attachmentIds?: number[];
             content?: string;
         };
     };
@@ -150,6 +231,79 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    upload: {
+        parameters: {
+            query?: {
+                conversationId?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "multipart/form-data": {
+                    /** Format: binary */
+                    file: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": components["schemas"]["ResultAttachmentVO"];
+                };
+            };
+        };
+    };
+    content: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                objectKey: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": string;
+                };
+            };
+        };
+    };
+    delete_1: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": components["schemas"]["ResultVoid"];
+                };
+            };
+        };
+    };
     list: {
         parameters: {
             query?: never;

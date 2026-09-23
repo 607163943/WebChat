@@ -33,3 +33,7 @@ build/
 .vscode/
 .env
 openapi.json
+
+### 附件本地存储 ###
+# 锚定模块根，别写成 data/ —— 那会连 src/main/resources 下的同名目录一起忽略
+/data/

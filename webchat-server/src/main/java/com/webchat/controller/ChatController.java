@@ -35,7 +35,7 @@ public class ChatController {
     @PostMapping("/{id}/messages")
     public Flux<ServerSentEvent<Object>> send(@PathVariable Long id,
                                               @RequestBody SendMessageRequest request) {
-        ChatContext context = chatStreamService.prepare(id, request.content());
+        ChatContext context = chatStreamService.prepare(id, request.content(), request.attachmentIds());
         return toSseStream(context);
     }
 

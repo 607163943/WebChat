@@ -3,16 +3,24 @@ package com.webchat.ai;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
+import com.webchat.config.AttachmentProperties;
 import com.webchat.config.CurrentUserProvider;
+import com.webchat.entity.Attachment;
 import com.webchat.entity.Conversation;
 import com.webchat.entity.Message;
 import com.webchat.mapper.ConversationMapper;
 import com.webchat.mapper.MessageMapper;
+import com.webchat.service.AttachmentService;
 import com.webchat.service.ConversationService;
+import com.webchat.storage.AttachmentStorageException;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.Content;
+import dev.langchain4j.data.message.ImageContent;
 import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.TextContent;
 import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.data.message.VideoContent;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
@@ -27,8 +35,13 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * 流式对话的编排：合并「落库」与「生成」两条线。
@@ -49,27 +62,36 @@ public class ChatStreamService {
     private static final String ROLE_ASSISTANT = "assistant";
     private static final String ROLE_SYSTEM = "system";
 
+    /** 白名单保证 mime_type 必然以它或 {@code video/} 开头，据此分派 ImageContent / VideoContent */
+    private static final String IMAGE_PREFIX = "image/";
+
     private final StreamingChatModel streamingChatModel;
     private final ConversationMapper conversationMapper;
     private final MessageMapper messageMapper;
     private final ConversationService conversationService;
+    private final AttachmentService attachmentService;
+    private final AttachmentProperties attachmentProperties;
     private final CurrentUserProvider currentUserProvider;
     private final TitleGenerator titleGenerator;
 
     /**
-     * 发送消息的同步前置：校验参数、落用户消息、组装模型输入。
+     * 发送消息的同步前置：校验参数、落用户消息、绑定附件、组装模型输入。
      *
      * <p>用户消息在这里就落库，好处是生成失败只丢回复、不丢提问，同时给「重新生成」留下可寻的尾部用户消息。
+     * 附件绑定也在同一个事务里——任何一条附件不可用都会把用户消息一起回滚，
+     * 免得留下一条既无文字也无附件的空消息。
      *
      * <p>必须由控制器调用以走到事务代理上；若被本类内部自调，{@code @Transactional} 会静默失效。
      */
     @Transactional
-    public ChatContext prepare(Long conversationId, String rawContent) {
+    public ChatContext prepare(Long conversationId, String rawContent, List<Long> attachmentIds) {
         long userId = currentUserProvider.userId();
         Conversation conversation = conversationService.requireOwned(conversationId);
 
         String content = rawContent == null ? "" : rawContent.strip();
-        if (content.isEmpty()) {
+        List<Long> ids = attachmentIds == null ? List.of() : attachmentIds.stream().distinct().toList();
+        // 只有附件、没有文字是允许的——传张图直接问「这是什么」很正常
+        if (content.isEmpty() && ids.isEmpty()) {
             throw new BizException(ResultCode.BAD_REQUEST, "消息内容不能为空");
         }
         if (content.length() > Prompt.MAX_USER_MESSAGE_LENGTH) {
@@ -87,7 +109,11 @@ public class ChatStreamService {
         messageMapper.insert(userMessage);
         conversationMapper.touch(conversationId, userId);
 
-        return buildContext(conversation, userId, history, content);
+        // 校验归属、未绑定、未过期，并回填 conversation_id
+        attachmentService.bindToMessage(ids, userMessage.getId(), conversationId);
+
+        return buildContext(conversation, userId, history, userMessage,
+                attachmentService.findByMessageId(userMessage.getId()));
     }
 
     /**
@@ -114,7 +140,10 @@ public class ChatStreamService {
 
         Message lastUserMessage = messages.get(messages.size() - 1);
         List<Message> history = messages.subList(0, messages.size() - 1);
-        return buildContext(conversation, userId, history, lastUserMessage.getContent());
+        // 附件轮的提问正文可能是空串，必须把它当初的附件一并取回来——否则重新生成等于发了个空提问，
+        // 答案与首次必然不同，而用户以为在重跑同一问
+        List<Attachment> attachments = attachmentService.findByMessageId(lastUserMessage.getId());
+        return buildContext(conversation, userId, history, lastUserMessage, attachments);
     }
 
     /**
@@ -230,19 +259,134 @@ public class ChatStreamService {
                 });
     }
 
-    private static ChatContext buildContext(Conversation conversation, long userId,
-                                            List<Message> history, String userContent) {
+    private ChatContext buildContext(Conversation conversation, long userId, List<Message> history,
+                                     Message userMessage, List<Attachment> userAttachments) {
+        List<Message> recentHistory = trimToRecent(history);
+        Map<Long, List<Attachment>> historyMedia = pickHistoryMedia(recentHistory, userAttachments);
+
         List<ChatMessage> modelMessages = new ArrayList<>();
         modelMessages.add(SystemMessage.from(Prompt.SYSTEM_PROMPT));
-        modelMessages.addAll(toChatMessages(trimToRecent(history)));
-        modelMessages.add(UserMessage.from(userContent));
+        for (Message message : recentHistory) {
+            modelMessages.add(toChatMessage(message, historyMedia.getOrDefault(message.getId(), List.of())));
+        }
+        modelMessages.add(toUserMessage(userMessage, userAttachments));
 
         // 标题只在「标题仍是默认值」且「这条是该会话第一条用户消息」时生成。
         // 前半句让「重新生成」不会给已有标题的会话改名，后半句又让它能补上首次生成失败而没写成的标题。
         boolean titleNeeded = ConversationService.DEFAULT_TITLE.equals(conversation.getTitle())
                 && history.stream().noneMatch(message -> ROLE_USER.equals(message.getRole()));
 
-        return new ChatContext(conversation.getId(), userId, List.copyOf(modelMessages), titleNeeded, userContent);
+        return new ChatContext(conversation.getId(), userId, List.copyOf(modelMessages), titleNeeded,
+                titleSourceOf(userMessage, userAttachments));
+    }
+
+    /**
+     * 挑出历史里还要发给模型的附件。
+     *
+     * <p>整轮请求（含本轮提问）的媒体总量有上界——数量不超过单条消息的上限、字节数不超过配置的上限。
+     * 本轮提问的附件优先占额度，剩下的从最近的历史消息往前补：最新那批正是用户刚发上去、
+     * 语义上也最相关的，更早的只发文本。没有这道闸，20 条历史 × 5 个文件会把请求撑爆。
+     */
+    private Map<Long, List<Attachment>> pickHistoryMedia(List<Message> recentHistory,
+                                                         List<Attachment> currentAttachments) {
+        long remainingCount = attachmentProperties.maxFilesPerMessage() - currentAttachments.size();
+        long remainingBytes = attachmentProperties.maxRequestMediaSize().toBytes()
+                - totalBytes(currentAttachments);
+        if (remainingCount <= 0 || remainingBytes <= 0 || recentHistory.isEmpty()) {
+            return Map.of();
+        }
+
+        List<Long> historyIds = recentHistory.stream().map(Message::getId).toList();
+        Map<Long, List<Attachment>> byMessage = attachmentService.findByMessageIds(historyIds).stream()
+                .collect(Collectors.groupingBy(Attachment::getMessageId,
+                        LinkedHashMap::new, Collectors.toList()));
+
+        Map<Long, List<Attachment>> picked = new LinkedHashMap<>();
+        long count = 0;
+        long bytes = 0;
+        // 从最新的一条往前取
+        for (int index = recentHistory.size() - 1; index >= 0 && count < remainingCount; index--) {
+            Message message = recentHistory.get(index);
+            if (!ROLE_USER.equals(message.getRole())) {
+                continue;
+            }
+            for (Attachment attachment : byMessage.getOrDefault(message.getId(), List.of())) {
+                long size = sizeOf(attachment);
+                if (count >= remainingCount || bytes + size > remainingBytes) {
+                    return picked;
+                }
+                picked.computeIfAbsent(message.getId(), key -> new ArrayList<>()).add(attachment);
+                count++;
+                bytes += size;
+            }
+        }
+        return picked;
+    }
+
+    private ChatMessage toChatMessage(Message message, List<Attachment> attachments) {
+        return switch (message.getRole()) {
+            case ROLE_USER -> toUserMessage(message, attachments);
+            case ROLE_ASSISTANT -> AiMessage.from(message.getContent());
+            case ROLE_SYSTEM -> SystemMessage.from(message.getContent());
+            default -> throw new IllegalStateException("未知的消息角色：" + message.getRole());
+        };
+    }
+
+    /**
+     * 组装用户消息。带附件时走多模态：文字与媒体各自是一个 content，媒体一律用 base64。
+     *
+     * <p>用 base64 而不是 URL，是因为开发环境的后端跑在内网（192.168.150.101），
+     * 模型侧根本拉不到那个地址；LangChain4j 的 DashScope 适配会把 base64 拼成
+     * {@code data:<mime>;base64,<数据>} 再发出去。
+     *
+     * <p>这里不需要显式打开什么「多模态开关」——DashScope 那个模型适配是按模型名判断的，
+     * {@code qwen3.8-max} 的版本号已经让它默认走多模态分支。
+     */
+    private UserMessage toUserMessage(Message message, List<Attachment> attachments) {
+        String text = message.getContent();
+        if (attachments.isEmpty()) {
+            return UserMessage.from(text == null ? "" : text);
+        }
+        List<Content> contents = new ArrayList<>();
+        if (text != null && !text.isBlank()) {
+            contents.add(TextContent.from(text));
+        }
+        attachments.stream().map(this::toMediaContent).flatMap(Optional::stream).forEach(contents::add);
+        if (contents.isEmpty()) {
+            // 有附件却一个都没读出来（对象已被清理之类）。UserMessage 由构造器强制 contents 非空，
+            // 与其让 LangChain4j 抛 IllegalArgumentException 变成 500，不如在这里说清楚
+            throw new BizException(ResultCode.BAD_REQUEST, "附件内容已不可用，请重新上传");
+        }
+        return UserMessage.builder().contents(contents).build();
+    }
+
+    private Optional<Content> toMediaContent(Attachment attachment) {
+        try {
+            String base64 = Base64.getEncoder().encodeToString(attachmentService.readContent(attachment));
+            String mimeType = attachment.getMimeType();
+            // 白名单只有图片与视频两类，顶层类型就是这一处要的分派依据。
+            // 工厂方法两个参数的顺序都是 (base64Data, mimeType)，且 mimeType 不能为空——
+            // DashScope 适配据此拼成 data:<mime>;base64,<数据>
+            return Optional.of(mimeType.startsWith(IMAGE_PREFIX)
+                    ? ImageContent.from(base64, mimeType)
+                    : VideoContent.from(base64, mimeType));
+        } catch (AttachmentStorageException e) {
+            // 历史附件读不出来就跳过这一段，不值得让整轮对话失败
+            log.warn("附件内容读取失败，本轮跳过：id={}, objectKey={}",
+                    attachment.getId(), attachment.getObjectKey(), e);
+            return Optional.empty();
+        }
+    }
+
+    /** 只有附件、没有文字时，拿文件名给标题生成器凑一个输入，总比给它一个空串强 */
+    private static String titleSourceOf(Message userMessage, List<Attachment> attachments) {
+        String content = userMessage.getContent();
+        if (content != null && !content.isBlank()) {
+            return content;
+        }
+        return attachments.isEmpty()
+                ? ""
+                : "（用户发来一个附件：" + attachments.get(0).getOriginalName() + "）";
     }
 
     private List<Message> selectMessages(Long conversationId) {
@@ -256,20 +400,16 @@ public class ChatStreamService {
         if (size <= Prompt.MAX_HISTORY_MESSAGES) {
             return history;
         }
+        // 附件预算在这个裁剪结果上算，否则会为随后被裁掉的消息白读一遍磁盘
         return history.subList(size - Prompt.MAX_HISTORY_MESSAGES, size);
     }
 
-    private static List<ChatMessage> toChatMessages(List<Message> messages) {
-        return messages.stream().map(ChatStreamService::toChatMessage).toList();
+    private static long totalBytes(List<Attachment> attachments) {
+        return attachments.stream().mapToLong(ChatStreamService::sizeOf).sum();
     }
 
-    private static ChatMessage toChatMessage(Message message) {
-        return switch (message.getRole()) {
-            case ROLE_USER -> UserMessage.from(message.getContent());
-            case ROLE_ASSISTANT -> AiMessage.from(message.getContent());
-            case ROLE_SYSTEM -> SystemMessage.from(message.getContent());
-            default -> throw new IllegalStateException("未知的消息角色：" + message.getRole());
-        };
+    private static long sizeOf(Attachment attachment) {
+        return attachment.getFileSize() == null ? 0L : attachment.getFileSize();
     }
 
     private static String briefReason(Throwable error) {
