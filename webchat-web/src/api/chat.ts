@@ -30,10 +30,16 @@ export interface ChatStreamHandlers {
 export async function sendMessage(
   conversationId: number,
   content: string,
+  attachmentIds: number[],
   handlers: ChatStreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
-  await streamChat(`/api/conversations/${conversationId}/messages`, { content }, handlers, signal)
+  await streamChat(
+    `/api/conversations/${conversationId}/messages`,
+    { content, attachmentIds },
+    handlers,
+    signal,
+  )
 }
 
 /** 重新生成：由服务端删掉最后一条助手回复，并复用其前面那条用户消息，用户消息不会重复插入 */

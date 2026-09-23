@@ -87,7 +87,13 @@ defineExpose({ stickToBottom })
 </script>
 
 <template>
-  <div ref="container" class="min-h-0 flex-1 overflow-y-auto px-4 pt-7 pb-[110px]">
+  <!-- 底部留白要给悬浮输入框让位。带上附件后输入框会变高，写死的 110px 就不够了，
+       所以读 ChatView 量出来的那个变量；27px 是原来 110 与输入框组 83 之间那段余量 -->
+  <div
+    ref="container"
+    class="min-h-0 flex-1 overflow-y-auto px-4 pt-7"
+    :style="{ paddingBottom: 'calc(var(--chat-input-h, 83px) + 27px)' }"
+  >
     <div class="mx-auto flex w-full max-w-[720px] flex-col gap-[26px]">
       <template v-for="row in rows" :key="row.key">
         <div v-if="row.kind === 'divider'" class="flex justify-center">

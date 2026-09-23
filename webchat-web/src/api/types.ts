@@ -8,8 +8,19 @@ import type { components } from './schema'
  */
 export type Conversation = Required<components['schemas']['ConversationVO']>
 
-/** 会话中的一条消息 */
-export type ChatMessage = Required<components['schemas']['MessageVO']>
+/** 一个已上传的附件。上传响应与消息回显共用同一个结构 */
+export type Attachment = Required<components['schemas']['AttachmentVO']>
+
+/**
+ * 会话中的一条消息。
+ *
+ * `attachments` 只在用户消息上可能非空；它是「刷新后附件还在」的唯一来源。
+ * 这里连数组元素一起收窄成必填——`Required<MessageVO>` 只把 `attachments` 本身变成必填，
+ * 元素类型仍是字段全可选的 `AttachmentVO`，直接传给组件会报类型不兼容。
+ */
+export type ChatMessage = Omit<Required<components['schemas']['MessageVO']>, 'attachments'> & {
+  attachments: Attachment[]
+}
 
 export type MessageRole = 'user' | 'assistant' | 'system'
 

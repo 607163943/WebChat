@@ -33,6 +33,34 @@ const showEmpty = computed(
     !sending.value,
 )
 
+const composer = ref<HTMLElement | null>(null)
+
+/**
+ * 输入框组的实测高度，写成 CSS 变量供下面两处使用。
+ *
+ * 原来是两个写死的常量：锚点位移里的 90.3 与消息列表的 pb-[110px]，它们都把
+ * 「输入框组 83.25px」算了进去。带上附件后胶囊会从 52 涨到 116，两个常量同时失效。
+ * 更要命的是这两处要的还不是同一个量——一个含问候语、一个不含，共用一个数字必然错一处。
+ * 所以这里只量「输入框组自己的高度」，两处各自推导。
+ *
+ * 量的是锚点而不是 ChatInput：问候语是 absolute bottom-full，不在锚点的盒子里，
+ * 所以锚点的 offsetHeight 恰好就是输入框组的高度。
+ */
+const chatInputHeight = ref(83)
+let resizeObserver: ResizeObserver | null = null
+
+function observeComposer(): void {
+  const element = composer.value
+  if (!element) {
+    return
+  }
+  resizeObserver = new ResizeObserver(() => {
+    chatInputHeight.value = element.offsetHeight
+  })
+  resizeObserver.observe(element)
+  chatInputHeight.value = element.offsetHeight
+}
+
 async function onSend(): Promise<void> {
   sending.value = true
   try {
@@ -45,9 +73,11 @@ async function onSend(): Promise<void> {
 
 onMounted(() => {
   void chat.initialize()
+  observeComposer()
 })
 
 onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
   // 页面离开时中断流式请求：后端会因此判定为「客户端断开」，本次回复不落库
   chat.abortStream()
 })
@@ -68,7 +98,10 @@ onBeforeUnmount(() => {
       @toggle="chat.toggleSidebar"
     />
 
-    <main class="@container-size relative flex min-w-0 flex-1 flex-col">
+    <main
+      class="@container-size relative flex min-w-0 flex-1 flex-col"
+      :style="{ '--chat-input-h': `${chatInputHeight}px` }"
+    >
       <!-- 侧边栏收拢后的展开入口。悬浮在左上角，所以下方内容要给它让位 -->
       <button
         v-if="chat.sidebarCollapsed"
@@ -117,15 +150,20 @@ onBeforeUnmount(() => {
       <!-- 输入区锚点：始终贴底，空状态时整组上浮到垂直居中（见下方位移公式）。
            pointer-events-none 是必需的——锚点是通栏的，会挡住左右两侧列表的点击 -->
       <div
+        ref="composer"
         class="pointer-events-none absolute inset-x-0 bottom-5 flex flex-col items-center px-4 transition-transform duration-450 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none"
-        :class="showEmpty ? 'translate-y-[calc(90.3px-50cqh)]' : 'translate-y-0'"
+        :style="{
+          transform: showEmpty
+            ? 'translateY(calc((var(--chat-input-h) + 57.6px) / 2 + 20px - 50cqh))'
+            : 'translateY(0)',
+        }"
       >
         <!-- 问候语不参与布局流，靠绝对定位挂在胶囊上方跟着一起走。
              若放进流里，它淡出时会把胶囊顶上 57.6px，位移变成两段跳。
 
              位移公式：锚点贴底时其底边在 H-20，空状态下整组垂直居中
-             （问候语 33.6 + gap 24 + 输入框组 83.25 = 140.85）时底边在 H/2 + 70.4，
-             两者相减得 50cqh - 90.3 的下移量，取负号即上浮。 -->
+             （问候语 33.6 + mb-6 24 + 输入框组实测高度）时底边在 H/2 + 组高/2，
+             两者相减即上面那个表达式。组高是量出来的，输入框带上附件后会自动跟着变。 -->
         <p
           class="text-foreground pointer-events-none absolute bottom-full left-1/2 mb-6 -translate-x-1/2 text-2xl leading-[1.4] font-semibold whitespace-nowrap transition-opacity duration-150 motion-reduce:transition-none"
           :class="showEmpty ? 'opacity-100' : 'opacity-0'"
@@ -136,8 +174,12 @@ onBeforeUnmount(() => {
         <ChatInput
           v-model="chat.draft"
           :streaming="chat.streaming"
+          :attachments="chat.attachments"
+          :uploading="chat.uploading"
           @send="onSend"
           @stop="chat.stopStreaming"
+          @pick-files="chat.addFiles"
+          @remove-attachment="chat.removeAttachment"
         />
       </div>
     </main>

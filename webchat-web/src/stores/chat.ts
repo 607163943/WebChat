@@ -9,8 +9,10 @@ import {
   listConversations,
   listMessages,
 } from '@/api/conversations'
+import { deleteAttachment as deleteAttachmentApi, uploadAttachment } from '@/api/attachments'
 import { ApiError } from '@/api/http'
-import type { ChatMessage, Conversation } from '@/api/types'
+import type { Attachment, ChatMessage, Conversation } from '@/api/types'
+import { MAX_FILES_PER_MESSAGE, validateFile } from '@/lib/attachments'
 
 const SIDEBAR_KEY = 'webchat:sidebar-collapsed'
 
@@ -49,6 +51,15 @@ export const useChatStore = defineStore('chat', () => {
    * 日后支持附件时，附件不进这里，失败也不还原。
    */
   const draft = ref('')
+  /**
+   * 已上传、还没随消息提交的附件（库里 message_id 为空的那个中间态）。
+   *
+   * 与 draft 一样托管在 store：切会话**不清空**它们（跟草稿的行为保持一致——草稿也不会因切会话而丢），
+   * 发送成功才清空。发送失败**不还原**——文件已经在服务端了，退回去还得重传一遍。
+   */
+  const attachments = ref<Attachment[]>([])
+  /** 有文件正在上传。期间不允许再选，避免并发上传把顺序打乱 */
+  const uploading = ref(false)
   /** 侧边栏是否收拢 */
   const sidebarCollapsed = ref(readStoredFlag(SIDEBAR_KEY))
 
@@ -174,7 +185,9 @@ export const useChatStore = defineStore('chat', () => {
    */
   async function send(): Promise<void> {
     const text = draft.value.trim()
-    if (!text || streaming.value) {
+    const pending = [...attachments.value]
+    // 只有附件、没有文字也允许发送——传张图直接问「这是什么」很正常
+    if ((!text && pending.length === 0) || streaming.value) {
       return
     }
     let id = currentId.value
@@ -188,12 +201,24 @@ export const useChatStore = defineStore('chat', () => {
     const conversationId = id
     // 先清空输入框；这一步失败时会由 runStream 还原回来
     draft.value = ''
-    // 后端在收到消息时就会落库，本地先乐观插入，省掉一次往返
-    messages.value.push(localMessage('user', text))
+    // 后端在收到消息时就会落库，本地先乐观插入，省掉一次往返。
+    // 附件也要跟着插进去，否则「只发附件」的那条在发送瞬间就是个空气泡
+    messages.value.push(localMessage('user', text, pending))
     const accepted = await runStream(
-      (handlers, signal) => sendMessageApi(conversationId, text, handlers, signal),
+      (handlers, signal) =>
+        sendMessageApi(
+          conversationId,
+          text,
+          pending.map((item) => item.id),
+          handlers,
+          signal,
+        ),
       text,
     )
+    if (accepted) {
+      // 附件已经绑到那条消息上了，输入框里的预览该收走
+      attachments.value = []
+    }
     if (createdNow && !accepted) {
       // 消息没发出去，这个会话就是白建的，一并撤掉（乐观插入的那条消息已由 runStream 撤回）
       await discardConversation(conversationId)
@@ -215,6 +240,70 @@ export const useChatStore = defineStore('chat', () => {
 
   function clearError(): void {
     errorMessage.value = ''
+  }
+
+  /**
+   * 选中文件后逐个校验、上传。
+   *
+   * 不合规的在这里就被挡下，省掉一次没有意义的传输；后端还会用同一份白名单再拦一次，
+   * 那一份才是真正的边界（这份改个请求就能绕过）。
+   */
+  async function addFiles(files: File[]): Promise<void> {
+    if (files.length === 0 || streaming.value || uploading.value) {
+      return
+    }
+    const problems: string[] = []
+    const candidates: File[] = []
+    for (const file of files) {
+      const problem = validateFile(file)
+      if (problem) {
+        problems.push(problem)
+      } else {
+        candidates.push(file)
+      }
+    }
+    const room = MAX_FILES_PER_MESSAGE - attachments.value.length
+    if (candidates.length > room) {
+      problems.push(
+        room <= 0
+          ? `一条消息最多带 ${MAX_FILES_PER_MESSAGE} 个附件`
+          : `一条消息最多带 ${MAX_FILES_PER_MESSAGE} 个附件，本次只收下前 ${room} 个`,
+      )
+      candidates.length = Math.max(room, 0)
+    }
+    // 错误横幅只有一个槽位，先报最先遇到的那个问题
+    errorMessage.value = problems[0] ?? ''
+    if (candidates.length === 0) {
+      return
+    }
+
+    uploading.value = true
+    try {
+      // 逐个上传而不是打包成一个请求：每个文件要各自拿到一个附件 id
+      for (const file of candidates) {
+        attachments.value.push(await uploadAttachment(file, currentId.value))
+      }
+    } catch (error) {
+      errorMessage.value = messageOf(error)
+    } finally {
+      uploading.value = false
+    }
+  }
+
+  /** 移除一个待发送的附件。先本地移除再调接口，失败就放回原位 */
+  async function removeAttachment(id: number): Promise<void> {
+    const index = attachments.value.findIndex((item) => item.id === id)
+    const removed = attachments.value[index]
+    if (!removed) {
+      return
+    }
+    attachments.value.splice(index, 1)
+    try {
+      await deleteAttachmentApi(id)
+    } catch (error) {
+      attachments.value.splice(index, 0, removed)
+      errorMessage.value = messageOf(error)
+    }
   }
 
   /**
@@ -253,6 +342,8 @@ export const useChatStore = defineStore('chat', () => {
               role: 'assistant',
               content: streamingText.value,
               createTime: new Date().toISOString(),
+              // 助手回复不带附件，但结构上这个字段是必填的
+              attachments: [],
             })
             streamingText.value = ''
           },
@@ -332,9 +423,13 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  function localMessage(role: ChatMessage['role'], content: string): ChatMessage {
+  function localMessage(
+    role: ChatMessage['role'],
+    content: string,
+    attachments: Attachment[] = [],
+  ): ChatMessage {
     // 负数 ID 只用于 v-for 的 key，真实 ID 在下次拉取会话消息时补齐
-    return { id: -Date.now(), role, content, createTime: new Date().toISOString() }
+    return { id: -Date.now(), role, content, createTime: new Date().toISOString(), attachments }
   }
 
   return {
@@ -347,6 +442,8 @@ export const useChatStore = defineStore('chat', () => {
     loadingMessages,
     errorMessage,
     draft,
+    attachments,
+    uploading,
     sidebarCollapsed,
     currentConversation,
     isConversationEmpty,
@@ -359,6 +456,8 @@ export const useChatStore = defineStore('chat', () => {
     stopStreaming,
     regenerateLast,
     clearError,
+    addFiles,
+    removeAttachment,
     toggleSidebar,
     abortStream,
   }

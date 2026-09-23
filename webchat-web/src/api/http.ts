@@ -80,3 +80,19 @@ export async function del<T>(url: string): Promise<T> {
     throw toApiError(error)
   }
 }
+
+/**
+ * 上传 multipart 表单。与 {@link post} 分开是因为两处默认值都得改：
+ *
+ * 1. **不要手设 Content-Type**——axios 会连同 boundary 一起生成，手设成 application/json
+ *    会让后端解析不出分段，直接报「当前请求不是 multipart」。
+ * 2. 上传要传字节，10MB 的文件在慢网络下很容易超过默认的 15 秒。
+ */
+export async function upload<T>(url: string, form: FormData, signal?: AbortSignal): Promise<T> {
+  try {
+    const { data } = await http.post<Result<T>>(url, form, { timeout: 60000, signal })
+    return unwrap(data)
+  } catch (error) {
+    throw toApiError(error)
+  }
+}

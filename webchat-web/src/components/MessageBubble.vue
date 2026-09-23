@@ -2,6 +2,7 @@
 import { defineAsyncComponent, onBeforeUnmount, ref } from 'vue'
 import { Check, Copy, RefreshCw } from '@lucide/vue'
 
+import MessageAttachments from '@/components/MessageAttachments.vue'
 import { copyText } from '@/lib/clipboard'
 import type { ChatMessage } from '@/api/types'
 
@@ -35,9 +36,15 @@ async function copy(): Promise<void> {
 </script>
 
 <template>
-  <!-- 用户消息：右对齐气泡，保留换行，不做 Markdown 解析 -->
-  <div v-if="props.message.role === 'user'" class="flex justify-end">
+  <!-- 用户消息：附件在上、文字气泡在下，整体右对齐；保留换行，不做 Markdown 解析 -->
+  <div v-if="props.message.role === 'user'" class="flex flex-col items-end gap-2.5">
+    <MessageAttachments
+      v-if="props.message.attachments.length > 0"
+      :attachments="props.message.attachments"
+    />
+    <!-- 只发附件不打字时没有正文，别留一个空的胶囊 -->
     <div
+      v-if="props.message.content"
       class="bg-muted max-w-[85%] rounded-[10px] px-3.5 py-2.5 text-[14px] leading-[1.6] wrap-break-word whitespace-pre-wrap"
     >
       {{ props.message.content }}
