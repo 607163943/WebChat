@@ -18,6 +18,7 @@
   --color-fg-secondary: var(--fg-secondary);
   --color-subtle-fg: var(--subtle-fg);
   --color-muted-active: var(--muted-active);
+  --color-muted-hover: var(--muted-hover);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -95,6 +96,9 @@
   --fg-secondary: #3f3f46;
   --subtle-fg: #a1a1aa;
   --muted-active: #eeeeef;
+  /* 设计稿只给了 muted-active（#EEEEF0，比 muted 深约 2%，肉眼几乎看不出），
+     它同时是侧栏选中行的底色，不能就地加深。按钮悬浮另给一档 zinc-200 */
+  --muted-hover: #e4e4e7;
 }
 
 /* 设计稿只有亮色一套，这里为将来可能的暗色模式预留，值按 zinc 暗色阶推导 */
@@ -135,6 +139,7 @@
   --fg-secondary: #a1a1aa;
   --subtle-fg: #71717a;
   --muted-active: #27272a;
+  --muted-hover: #3f3f46;
 }
 
 /* 打字指示器：三个圆点依次轻微上浮，比 Tailwind 自带的 animate-bounce 幅度小得多 */

@@ -128,7 +128,7 @@ function onFilesPicked(event: Event): void {
 
         <button
           type="button"
-          class="bg-muted text-fg-secondary hover:bg-muted-active flex size-8 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+          class="text-fg-secondary hover:bg-muted-hover bg-transparent flex size-10 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
           :disabled="pickDisabled"
           title="添加图片或视频"
           @click="fileInput?.click()"
@@ -152,7 +152,7 @@ function onFilesPicked(event: Event): void {
         <button
           v-if="props.streaming"
           type="button"
-          class="bg-primary text-primary-foreground hover:bg-primary/90 flex size-8 shrink-0 items-center justify-center rounded-full transition-colors"
+          class="bg-primary text-primary-foreground hover:bg-primary/90 flex size-10 shrink-0 items-center justify-center rounded-full transition-colors"
           title="停止生成"
           @click="emit('stop')"
         >
@@ -162,7 +162,7 @@ function onFilesPicked(event: Event): void {
         <button
           v-else
           type="button"
-          class="flex size-8 shrink-0 items-center justify-center rounded-full transition-colors"
+          class="flex size-10 shrink-0 items-center justify-center rounded-full transition-colors"
           :class="
             canSend
               ? 'bg-primary text-primary-foreground hover:bg-primary/90'
