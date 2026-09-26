@@ -87,6 +87,49 @@ function onFilesPicked(event: Event): void {
     emit('pick-files', files)
   }
 }
+
+/**
+ * 粘贴剪贴板里的文件（截图、复制的图片或视频）。
+ *
+ * **只挂在 textarea 上**：paste 事件本身就只在获得焦点的可编辑元素上触发，
+ * 挂这里天然就是「光标真在输入框里才生效」；挂到 document 上会连别处的粘贴一起接管。
+ *
+ * 两个提前返回都是为了不破坏文本粘贴——**只有真取到文件才 preventDefault**：
+ * 一旦无条件拦下，普通文本粘贴就再也进不来输入框了。
+ *
+ * 剪贴板里同时有文字和图片时以**文字**为准（从 Excel 复制单元格、从 Word 复制图文段落
+ * 都会同时带上一个位图），否则用户以为在贴表格，结果上传了一张表格截图。
+ * 判据取非空 text/plain：纯截图（Win+Shift+S、右键「复制图片」）的剪贴板里没有文字条目。
+ */
+function onPaste(event: ClipboardEvent): void {
+  const data = event.clipboardData
+  if (!data) {
+    return
+  }
+  if (data.getData('text/plain').trim().length > 0) {
+    return
+  }
+  const files: File[] = []
+  // 用 items 而不是 files：items 带 kind，能一眼排除文字条目。
+  // 文字条目的 kind 是 'string'，不排除的话 text/html 这类也会被当成文件
+  for (const item of data.items) {
+    if (item.kind !== 'file') {
+      continue
+    }
+    const file = item.getAsFile()
+    if (file) {
+      files.push(file)
+    }
+  }
+  if (files.length === 0) {
+    // 空剪贴板，或只有 text/html 没有纯文本：放行，让浏览器按默认行为处理
+    return
+  }
+  // 拦下是为了不让浏览器再往输入框里补一段文件名之类的文本；
+  // 文件能不能收下由 store 判断（生成中、超限、格式不符都在那边给提示）
+  event.preventDefault()
+  emit('pick-files', files)
+}
 </script>
 
 <template>
@@ -144,6 +187,7 @@ function onFilesPicked(event: Event): void {
           class="placeholder:text-subtle-fg max-h-[140px] min-h-8 flex-1 resize-none overflow-y-hidden bg-transparent py-1 text-[14px] leading-[1.6] outline-none"
           @input="resize"
           @keydown="onKeydown"
+          @paste="onPaste"
           @compositionstart="composing = true"
           @compositionend="composing = false"
         />

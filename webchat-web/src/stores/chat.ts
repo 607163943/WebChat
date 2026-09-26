@@ -243,13 +243,21 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   /**
-   * 选中文件后逐个校验、上传。
+   * 文件入口（「+」按钮选择、输入框里粘贴）共用的一条路：逐个校验、上传。
    *
    * 不合规的在这里就被挡下，省掉一次没有意义的传输；后端还会用同一份白名单再拦一次，
    * 那一份才是真正的边界（这份改个请求就能绕过）。
    */
   async function addFiles(files: File[]): Promise<void> {
-    if (files.length === 0 || streaming.value || uploading.value) {
+    if (files.length === 0) {
+      return
+    }
+    // 生成中 / 上传中不收新文件。「+」按钮这时是置灰的，那是一种看得见的拒绝；
+    // 粘贴没有这层视觉反馈，不说一声用户只会以为粘贴没生效（这个分支实际上只有粘贴能走到）
+    if (streaming.value || uploading.value) {
+      errorMessage.value = streaming.value
+        ? '正在生成回复，等这一轮结束再添加附件'
+        : '还有文件在上传，稍等一下再添加'
       return
     }
     const problems: string[] = []
