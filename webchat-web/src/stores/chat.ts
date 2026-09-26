@@ -89,18 +89,32 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function openConversation(id: number): Promise<void> {
+  /**
+   * 打开一个会话，把消息换成它的。
+   *
+   * @returns 这个会话是否可用。false 表示它不存在或不属于当前用户（后端 404）——
+   *   地址里那个 id 就此作废，调用方（ChatView 的地址 watcher）据此回落到新会话；
+   *   网络故障之类的失败算「可用」，保留用户当前的选择，只把错误提示出来。
+   */
+  async function openConversation(id: number): Promise<boolean> {
     if (currentId.value === id) {
-      return
+      return true
     }
     abortStream()
     currentId.value = id
     messages.value = []
     loadingMessages.value = true
     try {
-      messages.value = await listMessages(id)
+      const loaded = await listMessages(id)
+      // 拉取期间用户可能已切到别的会话（含切回新会话草稿态）：这份结果过期了，
+      // 丢掉——否则它会把后来那个会话的消息覆盖掉
+      if (currentId.value === id) {
+        messages.value = loaded
+      }
+      return true
     } catch (error) {
       errorMessage.value = messageOf(error)
+      return !(error instanceof ApiError && error.status === 404)
     } finally {
       loadingMessages.value = false
     }

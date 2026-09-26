@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { PanelLeft, X } from '@lucide/vue'
 
 import ChatInput from '@/components/ChatInput.vue'
@@ -32,6 +33,83 @@ const showEmpty = computed(
     !chat.loadingConversations &&
     !sending.value,
 )
+
+/**
+ * 地址与「当前是哪个会话」的双向同步。
+ *
+ * 地址是打开会话的外部入口：刷新、手输、前进后退都从地址进来（地址 → store）；
+ * 而程序自己造成的会话变化——首条消息落库后出现的 id、删除当前会话、打不开的地址回落——
+ * 反过来把地址对齐（store → 地址）。两个方向各自只写自己那一侧，衔接点是 currentId。
+ */
+const route = useRoute()
+const router = useRouter()
+
+/** 会话 id ↔ 地址的唯一换算。草稿态（还没落库的会话）没有 id，落在根路径 */
+function conversationPath(id: number | null): string {
+  return id === null ? '/' : `/${id}`
+}
+
+/** 解析地址末段的会话 id；没有这一段、或不是正整数（/foo、/0）都返回 null */
+function parseConversationId(raw: string | string[] | undefined): number | null {
+  const text = Array.isArray(raw) ? raw[0] : raw
+  if (text === undefined || !/^\d+$/.test(text)) {
+    return null
+  }
+  const value = Number(text)
+  return Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+/**
+ * 地址 → 状态。
+ *
+ * immediate 让刷新页面走的是同一条路：地址里带着 id 就直接去开那个会话，
+ * 而不是先渲染一个新会话界面再跳过去（那会闪一下空状态，白跑一次动画）。
+ */
+watch(
+  () => route.params.id,
+  async (raw) => {
+    const id = parseConversationId(raw)
+    if (id === null) {
+      chat.startConversation()
+      if (raw !== undefined) {
+        // 末段不是有效 id（手输 /foo、过期的旧链接）：收回根路径，别停在打不开的地址上
+        await router.replace('/')
+      }
+      return
+    }
+    if (!(await chat.openConversation(id))) {
+      // 会话打不开（已删除、不属于当前用户）：这个地址已经作废，回落成新会话。
+      // 地址由下面那个 watcher 顺带收回根路径
+      chat.startConversation()
+    }
+  },
+  { immediate: true },
+)
+
+/**
+ * 状态 → 地址。
+ *
+ * 这里出现的地址变化都是程序的副产物（会话落库、删除、回落），一律 replace，
+ * 不往历史里塞记录——历史只记用户点出来的会话（见 onSelect）。
+ */
+watch(
+  () => chat.currentId,
+  (id) => {
+    const path = conversationPath(id)
+    if (route.path !== path) {
+      void router.replace(path)
+    }
+  },
+)
+
+/** 选中侧边栏里的会话：走地址，真正的打开由上面的 watcher 做——地址是唯一入口 */
+function onSelect(id: number): void {
+  void router.push(conversationPath(id))
+}
+
+function onCreate(): void {
+  void router.push('/')
+}
 
 const composer = ref<HTMLElement | null>(null)
 
@@ -92,8 +170,8 @@ onBeforeUnmount(() => {
       :current-id="chat.currentId"
       :loading="chat.loadingConversations"
       :collapsed="chat.sidebarCollapsed"
-      @select="chat.openConversation"
-      @create="chat.startConversation"
+      @select="onSelect"
+      @create="onCreate"
       @remove="chat.removeConversation"
       @toggle="chat.toggleSidebar"
     />
