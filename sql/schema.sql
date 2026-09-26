@@ -36,9 +36,10 @@ CREATE TABLE `tb_message` (
     KEY `idx_conversation_id` (`conversation_id`, `id`)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '消息表';
 
--- 附件表：一条记录代表一个已上传的图片 / 音频文件
+-- 附件表：一条记录代表一个已上传的图片 / 视频 / 文本文件
 -- message_id 是否为空即附件的绑定状态（为空=待绑定）；清理判定与对象回收见 Obsidian《数据库表设计.md》「五、附件表」
--- 无 type 列：image/audio 分类由 mime_type 的顶层类型推出，合法性由上传接口的 MIME 白名单保证（同上文「五、附件表」）
+-- 无 type 列：image/video/text 分类由 mime_type 的顶层类型推出，合法性由上传接口的 MIME 白名单保证（同上文「五、附件表」）
+-- 文本附件另有一份纯内存的向量副本（不落库、重启即清空），用于提问时检索
 CREATE TABLE `tb_attachment` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '附件ID',
     `user_id` bigint unsigned NOT NULL COMMENT '上传者用户ID',
@@ -47,7 +48,7 @@ CREATE TABLE `tb_attachment` (
     `original_name` varchar(255) NOT NULL COMMENT '原始文件名，仅用于展示',
     `object_key` varchar(512) NOT NULL COMMENT '存储对象键，删除对象与重新签名都靠它',
     `url` varchar(2048) NOT NULL COMMENT '访问URL，用于回显',
-    `mime_type` varchar(100) NOT NULL COMMENT 'MIME类型，如 image/png，是文件类型的唯一依据',
+    `mime_type` varchar(100) NOT NULL COMMENT 'MIME类型，如 image/png、text/plain，是文件类型的唯一依据',
     `file_size` bigint unsigned NOT NULL COMMENT '文件大小（字节）',
     `retry_count` int unsigned NOT NULL DEFAULT 0 COMMENT '清理失败重试次数',
     `create_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间，未绑定附件的过期判定基准',

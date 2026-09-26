@@ -51,4 +51,13 @@ public interface AttachmentService {
 
     /** 取某一条消息的附件。重新生成时按尾部用户消息取回 */
     List<Attachment> findByMessageId(Long messageId);
+
+    /**
+     * 取某会话内全部<b>文本</b>附件的 id，即将被检索的那批。
+     *
+     * <p>返回 id 而不是行，是因为调用方只需要拿它去过滤向量库；图片与视频不进向量库，不需要返回。
+     * 结果含尚未随消息发出的那些吗？不含——上传时 conversation_id 可能还是空（草稿态），
+     * 要等随消息绑定后才回填，而本方法只在绑定之后被调用。
+     */
+    List<Long> listTextAttachmentIds(Long conversationId);
 }

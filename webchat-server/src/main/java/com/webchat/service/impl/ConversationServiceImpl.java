@@ -1,6 +1,7 @@
 package com.webchat.service.impl;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.CurrentUserProvider;
@@ -27,6 +28,7 @@ public class ConversationServiceImpl implements ConversationService {
     private final ConversationMapper conversationMapper;
     private final MessageMapper messageMapper;
     private final AttachmentService attachmentService;
+    private final DocumentIndexService documentIndexService;
     private final CurrentUserProvider currentUserProvider;
 
     @Override
@@ -66,6 +68,9 @@ public class ConversationServiceImpl implements ConversationService {
             // 幂等：不存在或不属于当前用户，都当作已删除，不报错
             return;
         }
+        // 会话没了，它带的文档也不该再被检索到。附件行本身照旧留给清理任务按判据回收，
+        // 但向量要现在就回收——否则在清理任务跑之前（最长一个扫描间隔）还能检索到已删会话的文件
+        documentIndexService.forgetAll(attachmentService.listTextAttachmentIds(id));
         messageMapper.delete(Wrappers.<Message>lambdaQuery().eq(Message::getConversationId, id));
         conversationMapper.deleteById(id);
     }

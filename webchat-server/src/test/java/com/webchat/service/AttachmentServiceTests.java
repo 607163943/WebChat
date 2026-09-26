@@ -1,6 +1,7 @@
 package com.webchat.service;
 
 import com.baomidou.mybatisplus.core.conditions.Wrapper;
+import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.common.BizException;
 import com.webchat.config.AttachmentProperties;
 import com.webchat.config.CurrentUserProvider;
@@ -19,6 +20,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.util.unit.DataSize;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 
@@ -52,6 +54,8 @@ class AttachmentServiceTests {
     private AttachmentStorage attachmentStorage;
     @Mock
     private CurrentUserProvider currentUserProvider;
+    @Mock
+    private DocumentIndexService documentIndexService;
 
     private final AttachmentTypePolicy typePolicy = new AttachmentTypePolicy();
 
@@ -63,10 +67,15 @@ class AttachmentServiceTests {
     }
 
     private AttachmentServiceImpl serviceWith(DataSize maxFileSize, DataSize maxRequestMediaSize) {
-        AttachmentProperties properties = new AttachmentProperties("./data/attachments", maxFileSize, 5,
-                maxRequestMediaSize, Duration.ofHours(24), Duration.ofMinutes(30), 5);
+        return serviceWith(maxFileSize, maxRequestMediaSize, DataSize.ofMegabytes(1));
+    }
+
+    private AttachmentServiceImpl serviceWith(DataSize maxFileSize, DataSize maxRequestMediaSize,
+                                              DataSize maxTextFileSize) {
+        AttachmentProperties properties = new AttachmentProperties("./data/attachments", maxFileSize,
+                maxTextFileSize, 5, maxRequestMediaSize, Duration.ofHours(24), Duration.ofMinutes(30), 5);
         return new AttachmentServiceImpl(attachmentMapper, conversationMapper, attachmentStorage,
-                typePolicy, properties, currentUserProvider);
+                typePolicy, properties, currentUserProvider, documentIndexService);
     }
 
     // ---------------------------------------------------------------- 上传
@@ -111,8 +120,10 @@ class AttachmentServiceTests {
     @DisplayName("超过单文件上限：400，且不落盘也不落库")
     void rejectsOversizeFile() {
         AttachmentServiceImpl tiny = serviceWith(DataSize.ofKilobytes(1), DataSize.ofMegabytes(20));
+        byte[] oversize = new byte[2048];
+        System.arraycopy(png(), 0, oversize, 0, png().length);
 
-        assertThatThrownBy(() -> tiny.upload(null, "big.png", "image/png", new byte[2048]))
+        assertThatThrownBy(() -> tiny.upload(null, "big.png", "image/png", oversize))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("超过");
 
@@ -126,6 +137,49 @@ class AttachmentServiceTests {
         assertThatThrownBy(() -> service.upload(null, "empty.png", "image/png", new byte[0]))
                 .isInstanceOf(BizException.class)
                 .hasMessageContaining("空");
+    }
+
+    @Test
+    @DisplayName("文本文件的上限比媒体严：同样 2KB，txt 被拒而图片照收")
+    void appliesStricterLimitToText() {
+        AttachmentServiceImpl strict = serviceWith(DataSize.ofMegabytes(10), DataSize.ofMegabytes(20),
+                DataSize.ofKilobytes(1));
+        // 两种类型各造一份同样大小、各自合法的内容，唯一的差别就只剩上限
+        byte[] text = "x".repeat(2048).getBytes(StandardCharsets.UTF_8);
+        byte[] image = new byte[2048];
+        System.arraycopy(png(), 0, image, 0, png().length);
+
+        assertThatThrownBy(() -> strict.upload(null, "长文.txt", "text/plain", text))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("文本文件超过");
+
+        when(currentUserProvider.userId()).thenReturn(USER_ID);
+        assertThat(strict.upload(null, "图.png", "image/png", image)).isNotNull();
+    }
+
+    @Test
+    @DisplayName("上传成功后就提交向量化索引；媒体也照提交，类型过滤在索引服务里做")
+    void submitsUploadedAttachmentForIndexing() {
+        when(currentUserProvider.userId()).thenReturn(USER_ID);
+
+        service.upload(null, "纪要.txt", "text/plain", "会议纪要正文".getBytes(StandardCharsets.UTF_8));
+
+        ArgumentCaptor<Attachment> captor = ArgumentCaptor.forClass(Attachment.class);
+        verify(documentIndexService).submit(captor.capture());
+        assertThat(captor.getValue().getMimeType()).isEqualTo("text/plain");
+    }
+
+    @Test
+    @DisplayName("落库失败就没有索引可提交：别为一个不存在的行留下向量")
+    void doesNotSubmitWhenInsertFails() {
+        when(currentUserProvider.userId()).thenReturn(USER_ID);
+        when(attachmentMapper.insert(any(Attachment.class))).thenThrow(new RuntimeException("库挂了"));
+
+        assertThatThrownBy(() -> service.upload(null, "纪要.txt", "text/plain",
+                "会议纪要正文".getBytes(StandardCharsets.UTF_8)))
+                .isInstanceOf(RuntimeException.class);
+
+        verify(documentIndexService, never()).submit(any(Attachment.class));
     }
 
     @Test

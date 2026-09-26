@@ -80,4 +80,21 @@ public interface AttachmentMapper extends BaseMapper<Attachment> {
     /** 清理失败时累加观测计数 */
     @Update("UPDATE tb_attachment SET retry_count = retry_count + 1 WHERE id = #{id}")
     int increaseRetryCount(@Param("id") Long id);
+
+    /**
+     * 某会话内全部文本附件的 id，供文档检索按它过滤向量库。
+     *
+     * <p>只按顶层类型取 {@code text/}：图片与视频是 base64 塞进多模态消息的，压根不在向量库里，
+     * 混进过滤条件只会白白拉长 {@code IN} 列表。用 {@code LIKE 'text/%'} 而不是写死
+     * {@code text/plain}，是为了日后加 md / csv 时不必回来改这里（白名单先行，这条自然跟上）。
+     */
+    @Select("""
+            SELECT id FROM tb_attachment
+            WHERE user_id = #{userId}
+              AND conversation_id = #{conversationId}
+              AND mime_type LIKE 'text/%'
+            ORDER BY id
+            """)
+    List<Long> selectTextAttachmentIds(@Param("conversationId") Long conversationId,
+                                       @Param("userId") Long userId);
 }

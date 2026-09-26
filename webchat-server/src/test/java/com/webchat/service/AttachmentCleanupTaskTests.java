@@ -1,5 +1,6 @@
 package com.webchat.service;
 
+import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.config.AttachmentProperties;
 import com.webchat.entity.Attachment;
 import com.webchat.mapper.AttachmentMapper;
@@ -39,15 +40,17 @@ class AttachmentCleanupTaskTests {
     private AttachmentMapper attachmentMapper;
     @Mock
     private AttachmentStorage attachmentStorage;
+    @Mock
+    private DocumentIndexService documentIndexService;
 
     private AttachmentCleanupTask task;
 
     @BeforeEach
     void setUp() {
         AttachmentProperties properties = new AttachmentProperties("./data/attachments",
-                DataSize.ofMegabytes(10), 5, DataSize.ofMegabytes(20),
+                DataSize.ofMegabytes(10), DataSize.ofMegabytes(1), 5, DataSize.ofMegabytes(20),
                 Duration.ofHours(24), Duration.ofMinutes(30), 5);
-        task = new AttachmentCleanupTask(attachmentMapper, attachmentStorage, properties);
+        task = new AttachmentCleanupTask(attachmentMapper, attachmentStorage, properties, documentIndexService);
     }
 
     private static Attachment candidate(long id, int retryCount) {
@@ -105,6 +108,27 @@ class AttachmentCleanupTaskTests {
 
         verify(attachmentMapper).increaseRetryCount(100L);
         verify(attachmentMapper).deleteById(101L);
+    }
+
+    @Test
+    @DisplayName("行被收走的同时回收它的向量：否则检索会把一个已不存在的文件喂给模型")
+    void forgetsVectorsOfRemovedRow() {
+        when(attachmentMapper.selectCleanupCandidates(anyLong())).thenReturn(List.of(candidate(100L, 0)));
+
+        task.runOnce();
+
+        verify(documentIndexService).forget(100L);
+    }
+
+    @Test
+    @DisplayName("删对象失败时不回收向量：行还在，下一轮还要重试")
+    void keepsVectorsWhenObjectRemovalFails() {
+        when(attachmentMapper.selectCleanupCandidates(anyLong())).thenReturn(List.of(candidate(100L, 0)));
+        doThrow(new AttachmentStorageException("IO 挂了", null)).when(attachmentStorage).delete(anyString());
+
+        task.runOnce();
+
+        verify(documentIndexService, never()).forget(anyLong());
     }
 
     @Test

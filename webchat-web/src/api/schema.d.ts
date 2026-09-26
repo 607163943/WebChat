@@ -15,9 +15,10 @@ export interface paths {
         put?: never;
         /**
          * 上传附件
-         * @description 图片或视频，单文件上限与允许的类型见 webchat.attachment 配置与 AttachmentTypePolicy。
+         * @description 图片、MP4 视频或 txt 文本文件，单文件上限与允许的类型见 webchat.attachment 配置与 AttachmentTypePolicy。
          *     上传即落库并返回可回显的 url，此时 message_id 为空（待绑定），随发送消息时提交 id 完成绑定。
          *     conversationId 可选：新对话草稿态还没有会话，留空即可。
+         *     文本文件会异步切分并向量化，供提问时检索；索引状态不落库，前端也不展示。
          */
         post: operations["upload"];
         delete?: never;

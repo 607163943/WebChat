@@ -1,5 +1,10 @@
 # 仅供 OpenApiExportTests 使用：导出 openapi.json 只需要上下文能启动，
-# 既不必连数据库，也不该依赖 .env 里的真实 API Key，所以把两个模型前缀都置成占位值。
+# 既不必连数据库，也不该依赖 .env 里的真实 API Key，所以把三个模型前缀都置成占位值。
+#
+# 每个前缀都不能少：DashScope 的自动配置对每个模型 bean 各挂一个
+# @ConditionalOnProperty(...api-key)，少配一个不会报错、只会少一个 bean，
+# 要到注入时才以 NoSuchBeanDefinitionException 失败——那时连上下文都起不来，
+# openapi.json 就再也导不出来了。embedding 那个正是被文档检索服务注入的。
 #
 # 数据源刻意不改：Hikari 是懒连接，导出接口不碰库，因此不需要为了这个测试引入 H2。
 langchain4j:
@@ -8,4 +13,6 @@ langchain4j:
       chat-model:
         api-key: apidocs-dummy
       streaming-chat-model:
+        api-key: apidocs-dummy
+      embedding-model:
         api-key: apidocs-dummy

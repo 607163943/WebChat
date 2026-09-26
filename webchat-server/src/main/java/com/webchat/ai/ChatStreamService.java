@@ -1,6 +1,8 @@
 package com.webchat.ai;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.webchat.ai.rag.DocumentIndexService;
+import com.webchat.ai.rag.RagProperties;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.AttachmentProperties;
@@ -49,7 +51,7 @@ import java.util.stream.Collectors;
  * <p>整体分三段，段与段的边界决定了错误处理方式：
  * <ol>
  *   <li>同步前置（{@link #prepare}）——还在响应提交之前，失败走普通 JSON 错误响应</li>
- *   <li>流式生成（{@link #stream}）——失败只能走 SSE 的 error 事件</li>
+ *   <li>文档检索 + 流式生成（{@link #stream}）——失败只能走 SSE 的 error 事件</li>
  *   <li>标题生成——排在 done 之后，失败必须静默吞掉</li>
  * </ol>
  */
@@ -62,8 +64,9 @@ public class ChatStreamService {
     private static final String ROLE_ASSISTANT = "assistant";
     private static final String ROLE_SYSTEM = "system";
 
-    /** 白名单保证 mime_type 必然以它或 {@code video/} 开头，据此分派 ImageContent / VideoContent */
+    /** 白名单保证 mime_type 必然以它、{@code video/} 或 {@code text/} 开头，据此分派 */
     private static final String IMAGE_PREFIX = "image/";
+    private static final String TEXT_PREFIX = "text/";
 
     private final StreamingChatModel streamingChatModel;
     private final ConversationMapper conversationMapper;
@@ -73,6 +76,8 @@ public class ChatStreamService {
     private final AttachmentProperties attachmentProperties;
     private final CurrentUserProvider currentUserProvider;
     private final TitleGenerator titleGenerator;
+    private final DocumentIndexService documentIndexService;
+    private final RagProperties ragProperties;
 
     /**
      * 发送消息的同步前置：校验参数、落用户消息、绑定附件、组装模型输入。
@@ -149,31 +154,54 @@ public class ChatStreamService {
     /**
      * 把一次生成过程表示成事件流。
      *
+     * <p>先做文档检索再出流：检索要调一次 embedding，结果要作为本轮提问的第一段文本注入，
+     * 所以它必须排在组装请求之前。检索跑在弹性线程池上（不占 Tomcat 请求线程），
+     * 并且<b>失败一律降级成「没检索到」</b>——资料取不到不该把一次对话变成失败。
+     *
      * <p>注意本方法<b>不开事务</b>：整段生成期间持有数据库连接会很快耗尽连接池。
      */
     public Flux<ChatEvent> stream(ChatContext context) {
-        Flux<ChatEvent> reply = replyFlux(context);
+        Flux<ChatEvent> reply = Mono.fromCallable(() -> documentIndexService.knowledgeFor(
+                        context.retrievalQuery(), context.retrievableAttachmentIds()))
+                .subscribeOn(Schedulers.boundedElastic())
+                // 检索在回复的关键路径上，而 SSE 协议里没有心跳事件：embedding 接口抖几秒，
+                // 用户那边就是「一个事件都收不到」的假死。到点就当作没检索到
+                .timeout(ragProperties.retrievalTimeout())
+                .onErrorResume(e -> {
+                    log.warn("文档检索失败，本轮不带资料继续：conversationId={}", context.conversationId(), e);
+                    return Mono.just("");
+                })
+                .flatMapMany(knowledge -> replyFlux(context, knowledge));
         if (!context.titleNeeded()) {
             return reply;
         }
         return reply.concatWith(titleFlux(context));
     }
 
-    private Flux<ChatEvent> replyFlux(ChatContext context) {
+    private Flux<ChatEvent> replyFlux(ChatContext context, String knowledge) {
+        List<ChatMessage> messages = assembleMessages(context, knowledge);
         AtomicBoolean cancelled = new AtomicBoolean(false);
         return Flux.<ChatEvent>create(sink -> {
                     sink.onCancel(() -> cancelled.set(true));
-                    requestModel(context, sink, cancelled);
+                    requestModel(context, messages, sink, cancelled);
                 }, FluxSink.OverflowStrategy.BUFFER)
                 // 让模型调用与随后的落库都离开 Tomcat 请求线程
                 .subscribeOn(Schedulers.boundedElastic());
     }
 
-    private void requestModel(ChatContext context, FluxSink<ChatEvent> sink, AtomicBoolean cancelled) {
+    /** 把系统提示词、历史、检索到的资料与本轮提问拼成最终发给模型的消息列表 */
+    private List<ChatMessage> assembleMessages(ChatContext context, String knowledge) {
+        List<ChatMessage> messages = new ArrayList<>(context.modelMessages());
+        messages.add(toUserMessage(context.currentMessage(), context.currentAttachments(), knowledge));
+        return List.copyOf(messages);
+    }
+
+    private void requestModel(ChatContext context, List<ChatMessage> messages,
+                              FluxSink<ChatEvent> sink, AtomicBoolean cancelled) {
         StringBuilder accumulated = new StringBuilder();
         try {
             streamingChatModel.chat(
-                    ChatRequest.builder().messages(context.modelMessages()).build(),
+                    ChatRequest.builder().messages(messages).build(),
                     new StreamingChatResponseHandler() {
 
                         @Override
@@ -269,32 +297,44 @@ public class ChatStreamService {
         for (Message message : recentHistory) {
             modelMessages.add(toChatMessage(message, historyMedia.getOrDefault(message.getId(), List.of())));
         }
-        modelMessages.add(toUserMessage(userMessage, userAttachments));
 
         // 标题只在「标题仍是默认值」且「这条是该会话第一条用户消息」时生成。
         // 前半句让「重新生成」不会给已有标题的会话改名，后半句又让它能补上首次生成失败而没写成的标题。
         boolean titleNeeded = ConversationService.DEFAULT_TITLE.equals(conversation.getTitle())
                 && history.stream().noneMatch(message -> ROLE_USER.equals(message.getRole()));
 
-        return new ChatContext(conversation.getId(), userId, List.copyOf(modelMessages), titleNeeded,
+        return new ChatContext(
+                conversation.getId(),
+                userId,
+                List.copyOf(modelMessages),
+                userMessage,
+                List.copyOf(userAttachments),
+                retrievalQueryOf(userMessage),
+                // 检索范围＝本会话内的全部文本附件，含本轮这条（刚绑定，已经带上 conversation_id）
+                attachmentService.listTextAttachmentIds(conversation.getId()),
+                titleNeeded,
                 titleSourceOf(userMessage, userAttachments));
     }
 
     /**
      * 挑出历史里还要发给模型的附件。
      *
-     * <p>整轮请求（含本轮提问）的媒体总量有上界——数量不超过单条消息的上限、字节数不超过配置的上限。
-     * 本轮提问的附件优先占额度，剩下的从最近的历史消息往前补：最新那批正是用户刚发上去、
+     * <p><b>媒体</b>（图片／视频）受预算约束：整轮请求的数量不超过单条消息的上限、字节数不超过配置的
+     * 上限，本轮提问的附件优先占额度，剩下的从最近的历史消息往前补——最新那批正是用户刚发上去、
      * 语义上也最相关的，更早的只发文本。没有这道闸，20 条历史 × 5 个文件会把请求撑爆。
+     *
+     * <p><b>文本附件不受预算约束、也不占额度</b>：它的内容不进请求体（走检索），带上它只是为了在历史
+     * 那条消息里渲染出一行「用户上传了文件：x.txt」。这一行不能省——那条消息的正文可能是空串
+     * （只传文件没打字），少了它就成了一条内容为空的用户消息。
      */
     private Map<Long, List<Attachment>> pickHistoryMedia(List<Message> recentHistory,
                                                          List<Attachment> currentAttachments) {
-        long remainingCount = attachmentProperties.maxFilesPerMessage() - currentAttachments.size();
-        long remainingBytes = attachmentProperties.maxRequestMediaSize().toBytes()
-                - totalBytes(currentAttachments);
-        if (remainingCount <= 0 || remainingBytes <= 0 || recentHistory.isEmpty()) {
+        if (recentHistory.isEmpty()) {
             return Map.of();
         }
+        List<Attachment> currentMedia = currentAttachments.stream().filter(a -> !isDocument(a)).toList();
+        long remainingCount = attachmentProperties.maxFilesPerMessage() - currentMedia.size();
+        long remainingBytes = attachmentProperties.maxRequestMediaSize().toBytes() - totalBytes(currentMedia);
 
         List<Long> historyIds = recentHistory.stream().map(Message::getId).toList();
         Map<Long, List<Attachment>> byMessage = attachmentService.findByMessageIds(historyIds).stream()
@@ -305,19 +345,23 @@ public class ChatStreamService {
         long count = 0;
         long bytes = 0;
         // 从最新的一条往前取
-        for (int index = recentHistory.size() - 1; index >= 0 && count < remainingCount; index--) {
+        for (int index = recentHistory.size() - 1; index >= 0; index--) {
             Message message = recentHistory.get(index);
             if (!ROLE_USER.equals(message.getRole())) {
                 continue;
             }
             for (Attachment attachment : byMessage.getOrDefault(message.getId(), List.of())) {
-                long size = sizeOf(attachment);
-                if (count >= remainingCount || bytes + size > remainingBytes) {
-                    return picked;
+                if (isDocument(attachment)) {
+                    picked.computeIfAbsent(message.getId(), key -> new ArrayList<>()).add(attachment);
+                    continue;
+                }
+                if (count >= remainingCount || bytes + sizeOf(attachment) > remainingBytes) {
+                    // 媒体额度用完就不再带更早的媒体，但循环要继续——后面的文本附件还得收进来说明文件
+                    continue;
                 }
                 picked.computeIfAbsent(message.getId(), key -> new ArrayList<>()).add(attachment);
                 count++;
-                bytes += size;
+                bytes += sizeOf(attachment);
             }
         }
         return picked;
@@ -325,7 +369,8 @@ public class ChatStreamService {
 
     private ChatMessage toChatMessage(Message message, List<Attachment> attachments) {
         return switch (message.getRole()) {
-            case ROLE_USER -> toUserMessage(message, attachments);
+            // 历史轮次不注入资料：检索结果只对本轮提问有意义，混进历史反而会重复占篇幅
+            case ROLE_USER -> toUserMessage(message, attachments, "");
             case ROLE_ASSISTANT -> AiMessage.from(message.getContent());
             case ROLE_SYSTEM -> SystemMessage.from(message.getContent());
             default -> throw new IllegalStateException("未知的消息角色：" + message.getRole());
@@ -333,25 +378,43 @@ public class ChatStreamService {
     }
 
     /**
-     * 组装用户消息。带附件时走多模态：文字与媒体各自是一个 content，媒体一律用 base64。
+     * 组装用户消息。
      *
-     * <p>用 base64 而不是 URL，是因为开发环境的后端跑在内网（192.168.150.101），
-     * 模型侧根本拉不到那个地址；LangChain4j 的 DashScope 适配会把 base64 拼成
-     * {@code data:<mime>;base64,<数据>} 再发出去。
+     * <p>内容的顺序是：检索到的资料 → 用户正文 → 文本附件说明 → 媒体。资料放在最前是因为它服务于
+     * 紧随其后的那个问题；它<b>不能单独作为一条 system 消息</b>——DashScope 的适配在清洗消息时，
+     * 遇到「system 之后不是 user」会把那条消息静默丢掉，不报错也不抛异常，RAG 会彻底失效却查不出
+     * 原因（见 {@link Prompt#KNOWLEDGE_PROMPT_TEMPLATE}）。
      *
-     * <p>这里不需要显式打开什么「多模态开关」——DashScope 那个模型适配是按模型名判断的，
-     * {@code qwen3.8-max} 的版本号已经让它默认走多模态分支。
+     * @param knowledge 检索到的片段正文，没有资料时为空串
      */
-    private UserMessage toUserMessage(Message message, List<Attachment> attachments) {
+    private UserMessage toUserMessage(Message message, List<Attachment> attachments, String knowledge) {
         String text = message.getContent();
-        if (attachments.isEmpty()) {
+        boolean hasKnowledge = knowledge != null && !knowledge.isBlank();
+        // 既没有附件也没有资料时走最朴素的路径，请求体与加 RAG 之前完全一致
+        if (attachments.isEmpty() && !hasKnowledge) {
             return UserMessage.from(text == null ? "" : text);
         }
+
         List<Content> contents = new ArrayList<>();
+        if (hasKnowledge) {
+            contents.add(TextContent.from(knowledge));
+        }
         if (text != null && !text.isBlank()) {
             contents.add(TextContent.from(text));
         }
-        attachments.stream().map(this::toMediaContent).flatMap(Optional::stream).forEach(contents::add);
+        // 文本附件本身不作为多模态内容发出去（内容走检索），但必须留下一行说明它是哪个文件，
+        // 否则「只带附件、没有文字」的那一轮会得到一份空的 contents，触发下面那道守卫——
+        // 用户收到的是「附件内容已不可用，请重新上传」，而文件其实好好的
+        List<Attachment> documents = attachments.stream().filter(ChatStreamService::isDocument).toList();
+        if (!documents.isEmpty()) {
+            contents.add(TextContent.from(documentNote(documents)));
+        }
+        attachments.stream()
+                .filter(attachment -> !isDocument(attachment))
+                .map(this::toMediaContent)
+                .flatMap(Optional::stream)
+                .forEach(contents::add);
+
         if (contents.isEmpty()) {
             // 有附件却一个都没读出来（对象已被清理之类）。UserMessage 由构造器强制 contents 非空，
             // 与其让 LangChain4j 抛 IllegalArgumentException 变成 500，不如在这里说清楚
@@ -360,11 +423,24 @@ public class ChatStreamService {
         return UserMessage.builder().contents(contents).build();
     }
 
+    /**
+     * 组装媒体内容。带附件时走多模态：文字与媒体各自是一个 content，媒体一律用 base64。
+     *
+     * <p>用 base64 而不是 URL，是因为开发环境的后端跑在内网（192.168.150.101），
+     * 模型侧根本拉不到那个地址；LangChain4j 的 DashScope 适配会把 base64 拼成
+     * {@code data:<mime>;base64,<数据>} 再发出去。
+     *
+     * <p>这里不需要显式打开什么「多模态开关」——DashScope 那个模型适配是按模型名判断的，
+     * {@code qwen3.8-max} 的版本号已经让它默认走多模态分支。
+     *
+     * <p>调用方保证传进来的都是媒体：白名单里的文本类型在 {@link #isDocument} 那里就被拦下了，
+     * 不拦的话它会被当成视频塞进 {@code VideoContent}。
+     */
     private Optional<Content> toMediaContent(Attachment attachment) {
         try {
             String base64 = Base64.getEncoder().encodeToString(attachmentService.readContent(attachment));
             String mimeType = attachment.getMimeType();
-            // 白名单只有图片与视频两类，顶层类型就是这一处要的分派依据。
+            // 走到这里的只剩图片与视频两类，顶层类型就是这一处要的分派依据。
             // 工厂方法两个参数的顺序都是 (base64Data, mimeType)，且 mimeType 不能为空——
             // DashScope 适配据此拼成 data:<mime>;base64,<数据>
             return Optional.of(mimeType.startsWith(IMAGE_PREFIX)
@@ -376,6 +452,24 @@ public class ChatStreamService {
                     attachment.getId(), attachment.getObjectKey(), e);
             return Optional.empty();
         }
+    }
+
+    /** 该附件是否走检索（文本），而不是作为媒体塞进请求体 */
+    private static boolean isDocument(Attachment attachment) {
+        String mimeType = attachment.getMimeType();
+        return mimeType != null && mimeType.startsWith(TEXT_PREFIX);
+    }
+
+    private static String documentNote(List<Attachment> documents) {
+        return documents.stream()
+                .map(document -> "（用户上传了文件：" + document.getOriginalName() + "）")
+                .collect(Collectors.joining());
+    }
+
+    /** 用于检索的提问文本；只带附件没打字时为空串，此时检索会被跳过 */
+    private static String retrievalQueryOf(Message userMessage) {
+        String content = userMessage.getContent();
+        return content == null ? "" : content.strip();
     }
 
     /** 只有附件、没有文字时，拿文件名给标题生成器凑一个输入，总比给它一个空串强 */

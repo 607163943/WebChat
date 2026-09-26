@@ -35,9 +35,10 @@ public class AttachmentController {
     private final AttachmentService attachmentService;
 
     @Operation(summary = "上传附件", description = """
-            图片或视频，单文件上限与允许的类型见 webchat.attachment 配置与 AttachmentTypePolicy。
+            图片、MP4 视频或 txt 文本文件，单文件上限与允许的类型见 webchat.attachment 配置与 AttachmentTypePolicy。
             上传即落库并返回可回显的 url，此时 message_id 为空（待绑定），随发送消息时提交 id 完成绑定。
-            conversationId 可选：新对话草稿态还没有会话，留空即可。""")
+            conversationId 可选：新对话草稿态还没有会话，留空即可。
+            文本文件会异步切分并向量化，供提问时检索；索引状态不落库，前端也不展示。""")
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public Result<AttachmentVO> upload(@RequestPart("file") MultipartFile file,
                                        @RequestParam(value = "conversationId", required = false) Long conversationId) {
@@ -63,6 +64,10 @@ public class AttachmentController {
                 .contentType(MediaType.parseMediaType(attachment.getMimeType()))
                 // private 不能省：附件正文不该被共享代理缓存下来
                 .cacheControl(CacheControl.maxAge(1, TimeUnit.DAYS).cachePrivate())
+                // 文本附件的白名单判据是「能解码成 UTF-8 / GB18030」，所以一个内容是 HTML 的文件
+                // 也能合法地传进来。这里返回的确实是 text/plain、浏览器不会执行它，
+                // 但显式禁止嗅探更稳——免得日后哪次改动让类型协商出岔子
+                .header("X-Content-Type-Options", "nosniff")
                 .body(content);
     }
 

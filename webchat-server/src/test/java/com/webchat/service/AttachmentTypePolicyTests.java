@@ -4,6 +4,7 @@ import com.webchat.common.BizException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -26,6 +27,45 @@ class AttachmentTypePolicyTests {
         assertThat(policy.resolveMimeType("image/jpeg", jpeg())).isEqualTo("image/jpeg");
         assertThat(policy.resolveMimeType("image/webp", webp())).isEqualTo("image/webp");
         assertThat(policy.resolveMimeType("video/mp4", mp4())).isEqualTo("video/mp4");
+    }
+
+    @Test
+    @DisplayName("文本没有文件头可嗅，改用「能不能严格解码」当判据：UTF-8 与 GB18030 都收")
+    void acceptsDecodableText() {
+        assertThat(policy.resolveMimeType("text/plain", text("这是一份会议纪要。"))).isEqualTo("text/plain");
+        // GB18030 是 GBK 的超集，中文 Windows 上存出来的 txt 多半是它
+        assertThat(policy.resolveMimeType("text/plain",
+                "中文编码的文本".getBytes(Charset.forName("GB18030")))).isEqualTo("text/plain");
+    }
+
+    @Test
+    @DisplayName("改名成 .txt 的二进制文件要拒收：文本这条路没有文件头可对，只能靠内容判断")
+    void rejectsBinaryRenamedToText() {
+        // PNG 头里带 NUL 字节，任何合法文本都不会有
+        assertThatThrownBy(() -> policy.resolveMimeType("text/plain", png()))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("不是 UTF-8");
+        // 纯随机的非法字节序列：两种字符集都解不出来
+        assertThatThrownBy(() -> policy.resolveMimeType("text/plain",
+                new byte[]{(byte) 0xC3, (byte) 0x28, (byte) 0xA0, (byte) 0xA1}))
+                .isInstanceOf(BizException.class);
+    }
+
+    @Test
+    @DisplayName("UTF-16 的 txt 会被拒：它必然含 NUL 字节，放进来只会得到一段乱码进向量库")
+    void rejectsUtf16Text() {
+        assertThatThrownBy(() -> policy.resolveMimeType("text/plain",
+                "UTF-16 编码的文本".getBytes(StandardCharsets.UTF_16LE)))
+                .isInstanceOf(BizException.class);
+    }
+
+    @Test
+    @DisplayName("文本走的是检索这条路，顶层类型要能一眼认出来")
+    void identifiesTextAsItsOwnTopLevelType() {
+        assertThat(policy.topLevelType("text/plain")).contains("text");
+        assertThat(policy.isText("text/plain")).isTrue();
+        assertThat(policy.isText("image/png")).isFalse();
+        assertThat(policy.extensionOf("text/plain")).isEqualTo("txt");
     }
 
     @Test
@@ -63,7 +103,9 @@ class AttachmentTypePolicyTests {
     void rejectsUnsupportedDeclaredTypes() {
         assertThat(policy.isSupported("image/svg+xml")).isFalse();
         assertThat(policy.isSupported("application/pdf")).isFalse();
-        assertThat(policy.isSupported("text/plain")).isFalse();
+        // 文本里只收纯文本：markdown 与 csv 在多数系统上另有 MIME，不在这次的范围内
+        assertThat(policy.isSupported("text/markdown")).isFalse();
+        assertThat(policy.isSupported("text/csv")).isFalse();
         assertThat(policy.isSupported(null)).isFalse();
 
         assertThatThrownBy(() -> policy.resolveMimeType("application/pdf", png()))
@@ -129,5 +171,9 @@ class AttachmentTypePolicyTests {
 
     private static byte[] mp3() {
         return new byte[]{'I', 'D', '3', 3, 0, 0};
+    }
+
+    private static byte[] text(String content) {
+        return content.getBytes(StandardCharsets.UTF_8);
     }
 }

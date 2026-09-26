@@ -1,6 +1,7 @@
 package com.webchat.service.impl;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.AttachmentProperties;
@@ -45,16 +46,29 @@ public class AttachmentServiceImpl implements AttachmentService {
     private final AttachmentTypePolicy typePolicy;
     private final AttachmentProperties properties;
     private final CurrentUserProvider currentUserProvider;
+    /**
+     * 上传后提交索引、删除时回收向量。
+     *
+     * <p>方向是「附件 → 检索」，反过来不成环：{@code DocumentIndexService} 依赖的是
+     * {@link AttachmentStorage} 与 {@link AttachmentTypePolicy}，<b>不依赖本类</b>。
+     * 那条边一旦加上去（哪怕只是想顺手查一下 mime），启动就会因循环引用直接失败。
+     */
+    private final DocumentIndexService documentIndexService;
 
     @Override
     public AttachmentVO upload(Long conversationId, String originalName, String contentType, byte[] content) {
         long userId = currentUserProvider.userId();
-        requireWithinSizeLimit(content);
+        requireNotEmpty(content);
         // 带了会话就必须是当前用户的，否则 404——不能让附件挂到别人的会话上
         if (conversationId != null) {
             requireOwnedConversation(conversationId, userId);
         }
+        // 先定出权威类型，再按类型选大小上限：文本的阈值（1MB）比媒体（10MB）严得多，
+        // 反过来的话就只能拿客户端声明的类型去猜该用哪个阈值了。
+        // 代价是一个改名的超大「文本」会先被解码一次才因超限被拒——multipart 那 10MB 的上限
+        // 兜住了最坏情况，这点开销不值得为它多绕一层
         String mimeType = typePolicy.resolveMimeType(contentType, content);
+        requireWithinSizeLimit(content, mimeType);
 
         String objectKey = buildObjectKey(mimeType);
         attachmentStorage.store(objectKey, content);
@@ -75,6 +89,9 @@ public class AttachmentServiceImpl implements AttachmentService {
             deleteObjectQuietly(objectKey);
             throw e;
         }
+        // 提交向量化索引。异步，且只对文本附件生效——这里拿到响应时索引多半还没跑完，
+        // 用户通常在打字，索引基本能在点发送之前结束
+        documentIndexService.submit(attachment);
         return toVO(attachment);
     }
 
@@ -109,6 +126,8 @@ public class AttachmentServiceImpl implements AttachmentService {
         // 先删对象再删行。反过来的话，对象删除失败就再也找不到那个键，成了永久泄漏
         attachmentStorage.delete(attachment.getObjectKey());
         attachmentMapper.deleteById(id);
+        // 行删掉了，它的向量也不能留着：否则检索会把一个用户已经删掉的文件内容喂给模型
+        documentIndexService.forget(id);
     }
 
     @Override
@@ -167,6 +186,11 @@ public class AttachmentServiceImpl implements AttachmentService {
         return findByMessageIds(List.of(messageId));
     }
 
+    @Override
+    public List<Long> listTextAttachmentIds(Long conversationId) {
+        return attachmentMapper.selectTextAttachmentIds(conversationId, currentUserProvider.userId());
+    }
+
     /** 对象键：按天分目录，避免单目录文件过多；扩展名只能来自白名单表 */
     private String buildObjectKey(String mimeType) {
         LocalDate today = LocalDate.now();
@@ -185,14 +209,37 @@ public class AttachmentServiceImpl implements AttachmentService {
         }
     }
 
-    private void requireWithinSizeLimit(byte[] content) {
-        if (content.length == 0) {
-            throw new BizException(ResultCode.BAD_REQUEST, "文件是空的，换一个再试");
-        }
-        long limit = properties.maxFileSize().toBytes();
+    /**
+     * 按<b>权威类型</b>选大小上限。
+     *
+     * <p>文本的阈值比媒体严得多，理由是成本而非安全：文本要切分后逐段调 embedding，
+     * 1MB 中文已约合 35 万 token，而模型的 TPM 是 100 万——一个满额文件就吃掉三分之一的
+     * 每分钟配额。图片视频没有这个问题，它们是整块塞进一次请求的。
+     */
+    private void requireWithinSizeLimit(byte[] content, String mimeType) {
+        long limit = limitFor(mimeType);
         if (content.length > limit) {
             throw new BizException(ResultCode.BAD_REQUEST,
-                    "文件超过 " + readableSize(limit) + "，换一个小一点的");
+                    (typePolicy.isText(mimeType) ? "文本文件" : "文件")
+                            + "超过 " + readableSize(limit) + "，换一个小一点的");
+        }
+    }
+
+    private long limitFor(String mimeType) {
+        return typePolicy.isText(mimeType)
+                ? properties.maxTextFileSize().toBytes()
+                : properties.maxFileSize().toBytes();
+    }
+
+    /**
+     * 空文件单独先判，且文案与「超限」分开。
+     *
+     * <p>若把它并进大小校验，图片路径上空内容会走到 {@code detect()} 那一步，拿到的提示会变成
+     * 「不是可识别的图片或视频」——比「文件是空的」难懂得多。
+     */
+    private static void requireNotEmpty(byte[] content) {
+        if (content.length == 0) {
+            throw new BizException(ResultCode.BAD_REQUEST, "文件是空的，换一个再试");
         }
     }
 

@@ -26,6 +26,9 @@ spring:
 langchain4j:
   community:
     dashscope:
+      embedding-model:
+        model-name: qwen3.7-text-embedding-flash
+        api-key: ${QWEN_API_KEY}
       chat-model:
         api-key: ${QWEN_API_KEY}
         model-name: qwen3.8-max
@@ -39,6 +42,9 @@ webchat:
     # 相对路径按后端进程的工作目录解析
     dir: ./data/attachments
     max-file-size: 10MB
+    # 文本文件单独收紧：它要切分后逐段调 embedding，成本随体量线性上升（1MB 中文约 35 万 token，
+    # 而模型的 TPM 是 100 万）。图片视频没有这个问题，它们是整块塞进一次请求的
+    max-text-file-size: 1MB
     max-files-per-message: 5
     # 整轮请求发给模型的媒体总量（base64 编码前）。只限个数不够：5 个 10MB 的文件编码后是 ~67MB
     max-request-media-size: 20MB
@@ -47,6 +53,19 @@ webchat:
     # 清理任务的扫描间隔，同时用作首次执行的延迟（@Scheduled 接受 30m 这种简单写法）
     cleanup-interval: 30m
     retry-alert-threshold: 5
+  # 文本附件的检索（RAG）。纯内存向量库，重启即失效，已绑定的附件要重新上传才有检索
+  rag:
+    max-results: 5
+    # 注意这不是余弦值：RelevanceScore = (cos + 1) / 2，所以 0.7 对应余弦 0.4。
+    # 按余弦的直觉填 0.5 是个陷阱——那等于「余弦 ≥ 0」，几乎什么都放行。
+    # 实测的两份小文档：与问题相关的那段落在 0.81~0.83，不相关的落在 0.7 以下
+    min-score: 0.7
+    chunk-size: 1200
+    chunk-overlap: 200
+    # 整个向量库的片段总数上限，约合 60MB 堆。超过后新文档不再索引，只记一条 warn
+    max-total-segments: 10000
+    # 检索在回复的关键路径上，而 SSE 没有心跳事件，超时就当作没检索到
+    retrieval-timeout: 3s
 # springdoc：让导出的 openapi.json 逐字节稳定，否则每次重新生成 git diff 都是噪音
 springdoc:
   writer-with-order-by-keys: true

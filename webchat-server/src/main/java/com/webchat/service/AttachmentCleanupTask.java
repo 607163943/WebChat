@@ -1,5 +1,6 @@
 package com.webchat.service;
 
+import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.config.AttachmentProperties;
 import com.webchat.entity.Attachment;
 import com.webchat.mapper.AttachmentMapper;
@@ -38,6 +39,14 @@ public class AttachmentCleanupTask {
     private final AttachmentMapper attachmentMapper;
     private final AttachmentStorage attachmentStorage;
     private final AttachmentProperties properties;
+    /**
+     * 行删掉之后回收它的向量。
+     *
+     * <p>这里覆盖的是「未绑定就过期」「所属消息已不存在」这些判据——其中包括「上传了 txt 却没发出去、
+     * 或者发了之后把会话删了」。少了这一步，这些附件的向量会一直留在内存里，既占空间，
+     * 也会让检索把一个已经不存在的文件的内容喂给模型。
+     */
+    private final DocumentIndexService documentIndexService;
 
     @Scheduled(fixedDelayString = INTERVAL, initialDelayString = INTERVAL)
     public void cleanup() {
@@ -87,6 +96,7 @@ public class AttachmentCleanupTask {
             return false;
         }
         attachmentMapper.deleteById(attachment.getId());
+        documentIndexService.forget(attachment.getId());
         return true;
     }
 }

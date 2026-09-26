@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Video, X } from '@lucide/vue'
+import { X } from '@lucide/vue'
 
 import { resolveAttachmentUrl } from '@/api/attachments'
 import type { Attachment } from '@/api/types'
-import { classify, kindLabel } from '@/lib/attachments'
+import { CARD_ACCENT, CARD_ICON, cardKindOf, classify, kindLabel } from '@/lib/attachments'
 
 const props = defineProps<{ attachment: Attachment }>()
 
 const emit = defineEmits<{ remove: [id: number] }>()
 
 const kind = computed(() => classify(props.attachment.mimeType))
+/** 模板里只用到非图片那一支，收窄一次省掉各处非空断言 */
+const cardKind = computed(() => cardKindOf(props.attachment.mimeType))
 const label = computed(() => kindLabel(kind.value ?? 'image'))
 </script>
 
@@ -25,13 +27,17 @@ const label = computed(() => kindLabel(kind.value ?? 'image'))
       class="border-border size-14 rounded-xl border object-cover"
     />
 
-    <!-- 视频：170×56 的卡片，与设计稿里音频那颗同构（图标砖 + 文件名 + 类型） -->
+    <!-- 视频与文本：170×56 的卡片，与设计稿里音频那颗同构（图标砖 + 文件名 + 类型），
+         两者的区别只在图标与强调色，取自共用的那两张表 -->
     <div
       v-else
       class="border-border bg-background flex h-14 w-[170px] items-center gap-2.5 rounded-xl border p-2"
     >
-      <div class="flex size-10 shrink-0 items-center justify-center rounded-[10px] bg-[#E11D481A]">
-        <Video class="size-5 text-[#E11D48]" />
+      <div
+        class="flex size-10 shrink-0 items-center justify-center rounded-[10px]"
+        :class="CARD_ACCENT[cardKind].tile"
+      >
+        <component :is="CARD_ICON[cardKind]" class="size-5" :class="CARD_ACCENT[cardKind].icon" />
       </div>
       <div class="flex min-w-0 flex-col gap-0.5">
         <span class="text-foreground truncate text-[13px] font-medium">

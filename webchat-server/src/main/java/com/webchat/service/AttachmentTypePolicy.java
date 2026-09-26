@@ -24,14 +24,24 @@ import static java.util.Map.entry;
  *
  * <p>光比对 {@code Content-Type} 是不够的：那个头由客户端提供，把 SVG 改名成 .png 再改头就能过。
  * 所以还要<b>嗅探文件头</b>，并要求嗅探结果的顶层类型与声明值一致。
+ *
+ * <p><b>纯文本是这条规则的一个例外</b>：{@code text/plain} 没有任何文件头可嗅，任何字节序列都可以
+ * 「是」一个 txt。所以它改用另一条判据——内容必须能按 UTF-8 或 GB18030 严格解码，且不含 NUL 字节
+ * （见 {@link PlainTextDecoder}）。编码拿不准就拒收：放一段乱码进去，检索会静默地不工作。
+ *
+ * <p>文本与图片／视频在链路上的去向也不同：媒体是 base64 塞进多模态消息，文本是切分后进向量库、
+ * 提问时检索片段注入提示词（见 {@code ai.rag}）。所以 {@link #topLevelType} 返回 {@code text} 的那些
+ * 附件不能再走 {@code ImageContent} / {@code VideoContent} 的分派。
  */
 @Component
 public class AttachmentTypePolicy {
 
     public static final String IMAGE = "image";
     public static final String VIDEO = "video";
+    public static final String TEXT = "text";
 
     private static final String SEPARATOR = "/";
+    private static final String TEXT_PLAIN = "text/plain";
 
     /**
      * MIME → 落盘扩展名。<b>只列能确认可用的格式</b>——多放一个没验证过的类型，
@@ -46,11 +56,17 @@ public class AttachmentTypePolicy {
             entry("image/gif", "gif"),
             entry("image/webp", "webp"),
             entry("image/bmp", "bmp"),
-            entry("video/mp4", "mp4"));
+            entry("video/mp4", "mp4"),
+            entry(TEXT_PLAIN, "txt"));
 
     /** 声明类型是否在白名单内 */
     public boolean isSupported(String mimeType) {
         return mimeType != null && EXTENSION_BY_MIME.containsKey(normalize(mimeType));
+    }
+
+    /** 该类型是否走检索而不是多模态 */
+    public boolean isText(String mimeType) {
+        return TEXT.equals(topLevelType(mimeType).orElse(null));
     }
 
     /** {@code image/png} → {@code image}；不在白名单内返回空 */
@@ -77,7 +93,16 @@ public class AttachmentTypePolicy {
         String declared = normalize(declaredMimeType);
         if (!isSupported(declared)) {
             throw new BizException(ResultCode.BAD_REQUEST,
-                    "不支持的文件类型，只能上传常见的图片（PNG / JPEG / GIF / WebP / BMP）或 MP4 视频");
+                    "不支持的文件类型，只能上传常见的图片（PNG / JPEG / GIF / WebP / BMP）、MP4 视频或 txt 文本文件");
+        }
+        if (TEXT_PLAIN.equals(declared)) {
+            // 文本没有文件头可嗅，改用「能不能严格解码成文本」当判据。声明值就是 text/plain，
+            // 解出来自然也是 text/plain，不存在图片那种「顶层类型对不上」的校验
+            if (PlainTextDecoder.decode(content).isEmpty()) {
+                throw new BizException(ResultCode.BAD_REQUEST,
+                        "这个文件的内容不是 UTF-8 或 GB18030 编码的纯文本（UTF-16 与二进制文件不支持）");
+            }
+            return TEXT_PLAIN;
         }
         String detected = detect(content)
                 .orElseThrow(() -> new BizException(ResultCode.BAD_REQUEST,
@@ -92,8 +117,10 @@ public class AttachmentTypePolicy {
     /**
      * 按文件头嗅探规范 MIME，识别不出返回空。
      *
-     * <p>覆盖范围与 {@link #EXTENSION_BY_MIME} 严格对齐。识别不出即拒收，宁可让少数上报异常的
-     * 文件被挡下，也不要放进一个无法确认类型的文件——类型是这条链路后续所有判断的唯一依据。
+     * <p>只覆盖带 magic bytes 的媒体格式；{@code text/plain} 不在其中，它由
+     * {@link PlainTextDecoder} 的可解码性判据把关（见 {@link #resolveMimeType}）。识别不出即拒收，
+     * 宁可让少数上报异常的文件被挡下，也不要放进一个无法确认类型的文件——类型是这条链路后续
+     * 所有判断的唯一依据。
      */
     public Optional<String> detect(byte[] content) {
         if (matches(content, 0, 0x89, 'P', 'N', 'G')) {

@@ -183,7 +183,7 @@ function onPaste(event: ClipboardEvent): void {
           type="button"
           class="text-fg-secondary hover:bg-muted-hover bg-transparent flex size-10 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
           :disabled="pickDisabled"
-          title="添加图片或视频"
+          title="添加图片、视频或文本文件"
           @click="fileInput?.click()"
         >
           <Plus class="size-4" />

@@ -22,6 +22,15 @@ public record AttachmentProperties(
         /** 单个文件大小上限，与 spring.servlet.multipart.max-file-size 保持一致 */
         @DefaultValue("10MB") DataSize maxFileSize,
 
+        /**
+         * 单个<b>文本</b>文件的大小上限，比媒体严得多。
+         *
+         * <p>文本要切分后逐段调 embedding，成本随体量线性上升：1MB 中文约 35 万 token，而
+         * {@code qwen3.7-text-embedding-flash} 的 TPM 是 100 万——一个满额的文件就吃掉三分之一的
+         * 每分钟配额，再同时传几个就会撞限流。10MB 的文本则要几百次调用、索引期间该文件一直不可检索。
+         */
+        @DefaultValue("1MB") DataSize maxTextFileSize,
+
         /** 单条消息能带的附件数量上限 */
         @DefaultValue("5") int maxFilesPerMessage,
 
