@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 import { regenerate as regenerateApi, sendMessage as sendMessageApi } from '@/api/chat'
@@ -12,9 +12,25 @@ import {
 import { deleteAttachment as deleteAttachmentApi, uploadAttachment } from '@/api/attachments'
 import { ApiError } from '@/api/http'
 import type { Attachment, ChatMessage, Conversation } from '@/api/types'
-import { MAX_FILES_PER_MESSAGE, validateFile } from '@/lib/attachments'
+import type { AttachmentKind } from '@/lib/attachments'
+import { MAX_FILES_PER_MESSAGE, classify, validateFile } from '@/lib/attachments'
 
 const SIDEBAR_KEY = 'webchat:sidebar-collapsed'
+
+/**
+ * 正在上传、还没拿到后端附件对象的文件。
+ *
+ * 它不是一个「附件」，只是预览行里的一格：上传成功就换成真正的 {@link Attachment}（连同缩略图或卡片），
+ * 失败则连同后面还没轮到的那些一起消失，只在顶部横幅留一句话。
+ */
+export interface PendingUpload {
+  /** 本地负数 id，与 localMessage 同一套路，只用于 v-for 的 key */
+  id: number
+  name: string
+  kind: AttachmentKind
+  /** 已交给网络栈的字节比例 0~1，到 1 之后后端还在处理（见 UploadingAttachment） */
+  progress: number
+}
 
 /** 读侧边栏的收拢状态。localStorage 可能被禁用（隐私模式等），一律静默兜底。 */
 function readStoredFlag(key: string): boolean {
@@ -58,6 +74,13 @@ export const useChatStore = defineStore('chat', () => {
    * 发送成功才清空。发送失败**不还原**——文件已经在服务端了，退回去还得重传一遍。
    */
   const attachments = ref<Attachment[]>([])
+  /**
+   * 正在上传的文件，排在 {@link attachments} 后面一起显示。
+   *
+   * 与 attachments 分开是必须的：它没有 id、没有 url、没有 mimeType，拿不到后端对象之前
+   * 压根构造不出一个 Attachment；硬塞进去会让「已就绪」和「还在传」两种态混成一个。
+   */
+  const pendingUploads = ref<PendingUpload[]>([])
   /** 有文件正在上传。期间不允许再选，避免并发上传把顺序打乱 */
   const uploading = ref(false)
   /** 侧边栏是否收拢 */
@@ -201,7 +224,9 @@ export const useChatStore = defineStore('chat', () => {
     const text = draft.value.trim()
     const pending = [...attachments.value]
     // 只有附件、没有文字也允许发送——传张图直接问「这是什么」很正常
-    if ((!text && pending.length === 0) || streaming.value) {
+    // 有文件还在上传时也拦住：这时发出去只会带上已传完的那几个，剩下的留在预览行，
+    // 用户会以为它们一起发出去了（发送按钮此时同样是禁用的，这里再拦一道）
+    if ((!text && pending.length === 0) || streaming.value || uploading.value) {
       return
     }
     let id = currentId.value
@@ -261,6 +286,8 @@ export const useChatStore = defineStore('chat', () => {
    *
    * 不合规的在这里就被挡下，省掉一次没有意义的传输；后端还会用同一份白名单再拦一次，
    * 那一份才是真正的边界（这份改个请求就能绕过）。
+   *
+   * 收下的文件先落进 {@link pendingUploads} 占位（带进度环），传完一个才变成 attachments 里的一项。
    */
   async function addFiles(files: File[]): Promise<void> {
     if (files.length === 0) {
@@ -300,13 +327,36 @@ export const useChatStore = defineStore('chat', () => {
     }
 
     uploading.value = true
+    // 选中的文件立刻全部进预览行，还没轮到的那几个停在 0%，传完一个才换成正式的回显。
+    // 于是预览行里的顺序天然与选择顺序一致：已完成的在前（先传完），排队中的在后
+    const queue: { file: File; item: PendingUpload }[] = []
+    for (const file of candidates) {
+      // 进度要写在**视图读到的那个代理**上才驱动更新，所以造出来就包一层 reactive 再推。
+      // 推裸对象的话，下面改的是那份裸对象，环不会动
+      const item = reactive<PendingUpload>({
+        id: -Date.now() - queue.length,
+        name: file.name,
+        kind: classify(file.type) ?? 'image',
+        progress: 0,
+      })
+      queue.push({ file, item })
+      pendingUploads.value.push(item)
+    }
     try {
       // 逐个上传而不是打包成一个请求：每个文件要各自拿到一个附件 id
-      for (const file of candidates) {
-        attachments.value.push(await uploadAttachment(file, currentId.value))
+      for (const { file, item } of queue) {
+        const attachment = await uploadAttachment(file, currentId.value, (progress) => {
+          item.progress = progress
+        })
+        attachments.value.push(attachment)
+        pendingUploads.value = pendingUploads.value.filter((entry) => entry.id !== item.id)
       }
     } catch (error) {
       errorMessage.value = messageOf(error)
+      // 循环在这里断了，队列里剩下的（含正在传的这个）一起撤掉——留着只会永远停在 0%，
+      // 而它们既没传上去也不会自己重试。已经传完的那几个仍在 attachments 里，不受影响
+      const dropped = new Set(queue.map(({ item }) => item.id))
+      pendingUploads.value = pendingUploads.value.filter((entry) => !dropped.has(entry.id))
     } finally {
       uploading.value = false
     }
@@ -465,6 +515,7 @@ export const useChatStore = defineStore('chat', () => {
     errorMessage,
     draft,
     attachments,
+    pendingUploads,
     uploading,
     sidebarCollapsed,
     currentConversation,

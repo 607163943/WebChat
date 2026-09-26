@@ -253,6 +253,7 @@ onBeforeUnmount(() => {
           v-model="chat.draft"
           :streaming="chat.streaming"
           :attachments="chat.attachments"
+          :pending-uploads="chat.pendingUploads"
           :uploading="chat.uploading"
           @send="onSend"
           @stop="chat.stopStreaming"

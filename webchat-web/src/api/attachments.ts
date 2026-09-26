@@ -8,18 +8,19 @@ import type { Attachment } from './types'
  * 用户完全可能在还没有会话的时候就把图片传上来，而会话是延迟落库的。
  *
  * @param conversationId 当前会话；新对话草稿态还没有会话，传 null
+ * @param onProgress 已发出的字节比例（0~1），用于预览行的进度环
  */
 export function uploadAttachment(
   file: File,
   conversationId: number | null,
-  signal?: AbortSignal,
+  onProgress?: (progress: number) => void,
 ): Promise<Attachment> {
   const form = new FormData()
   form.append('file', file)
   if (conversationId !== null) {
     form.append('conversationId', String(conversationId))
   }
-  return upload<Attachment>('/api/attachments', form, signal)
+  return upload<Attachment>('/api/attachments', form, onProgress)
 }
 
 /** 删除一个还没随消息发出的附件。后端幂等，重复删除不报错 */

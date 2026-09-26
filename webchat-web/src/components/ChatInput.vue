@@ -1,15 +1,19 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { ArrowUp, Loader2, Plus, Square } from '@lucide/vue'
+import { ArrowUp, Plus, Square } from '@lucide/vue'
 
 import AttachmentPreview from '@/components/AttachmentPreview.vue'
+import UploadingAttachment from '@/components/UploadingAttachment.vue'
 import type { Attachment } from '@/api/types'
+import type { PendingUpload } from '@/stores/chat'
 import { ACCEPT_ATTRIBUTE } from '@/lib/attachments'
 
 const props = defineProps<{
   streaming: boolean
   /** 已上传、待随消息提交的附件 */
   attachments: Attachment[]
+  /** 正在上传的文件，排在已上传的那些后面 */
+  pendingUploads: PendingUpload[]
   uploading: boolean
 }>()
 
@@ -33,8 +37,15 @@ const fileInput = ref<HTMLInputElement | null>(null)
 /** 中文输入法组字期间按回车是在选字，不能当作发送 */
 const composing = ref(false)
 
-/** 只有附件、没有文字同样可以发送——传张图直接问「这是什么」是很常见的用法 */
-const canSend = computed(() => draft.value.trim().length > 0 || props.attachments.length > 0)
+/**
+ * 只有附件、没有文字同样可以发送——传张图直接问「这是什么」是很常见的用法。
+ *
+ * 有文件还在上传时不算可发送：这时发出去只会带上已传完的那几个，剩下的留在预览行，
+ * 用户会以为它们一起发出去了。按钮样式、disabled 与回车都看这一个判断。
+ */
+const canSend = computed(
+  () => !props.uploading && (draft.value.trim().length > 0 || props.attachments.length > 0),
+)
 
 const pickDisabled = computed(() => props.streaming || props.uploading)
 
@@ -58,7 +69,8 @@ function resize(): void {
 }
 
 function submit(): void {
-  // 生成中按回车不发新消息（store 侧也会拦，这里拦是为了不改动输入框内容）
+  // 生成中按回车不发新消息（store 侧也会拦，这里拦是为了不改动输入框内容）；
+  // 上传中那一半由 canSend 兜着，同样是为了让草稿原样留在框里
   if (!canSend.value || props.streaming) {
     return
   }
@@ -140,7 +152,7 @@ function onPaste(event: ClipboardEvent): void {
     >
       <!-- 附件行：设计稿里行高 56、项间 gap 8，只有这一行出现时胶囊才变高 -->
       <div
-        v-if="props.attachments.length > 0 || props.uploading"
+        v-if="props.attachments.length > 0 || props.pendingUploads.length > 0"
         class="flex w-full flex-wrap items-center gap-2"
       >
         <AttachmentPreview
@@ -149,14 +161,12 @@ function onPaste(event: ClipboardEvent): void {
           :attachment="attachment"
           @remove="emit('remove-attachment', $event)"
         />
-        <!-- 上传中的占位，让用户知道文件已经在传了 -->
-        <div
-          v-if="props.uploading"
-          class="border-border bg-muted text-subtle-fg flex size-14 shrink-0 items-center justify-center rounded-xl border"
-          title="正在上传…"
-        >
-          <Loader2 class="size-4 animate-spin" />
-        </div>
+        <!-- 上传中的排后面：逐个上传，已完成的必然是先传完的，两段接起来就是选择顺序 -->
+        <UploadingAttachment
+          v-for="pending in props.pendingUploads"
+          :key="pending.id"
+          :pending="pending"
+        />
       </div>
 
       <div class="flex w-full items-center gap-2">
