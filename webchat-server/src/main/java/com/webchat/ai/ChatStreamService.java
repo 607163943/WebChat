@@ -42,7 +42,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 /**
@@ -118,14 +117,17 @@ public class ChatStreamService {
         attachmentService.bindToMessage(ids, userMessage.getId(), conversationId);
 
         return buildContext(conversation, userId, history, userMessage,
-                attachmentService.findByMessageId(userMessage.getId()));
+                attachmentService.findByMessageId(userMessage.getId()), null);
     }
 
     /**
-     * 重新生成的同步前置：删掉最后一条助手回复，改用其前面那条用户消息重跑。
+     * 重新生成的同步前置：找到最后一条助手回复，改用其前面那条用户消息重跑。
      *
      * <p>由服务端来判断「重生成哪一条」，而不是让前端把内容再发一遍——这样用户消息不会被重复插入，
-     * 连点两次也是安全的（第二次只是把它刚生成的那条回复再删掉重来）。
+     * 连点两次也是安全的（第二次只是把它刚生成的那条回复再覆盖一遍）。
+     *
+     * <p>那条旧回复<b>不删</b>，本轮结束后原地覆盖它（见 {@link #saveReply}）：删了再插会换一个 id，
+     * 而这一轮同样可能以半截内容收场，覆盖是唯一不留下垃圾行的做法。
      */
     @Transactional
     public ChatContext prepareRegenerate(Long conversationId) {
@@ -134,9 +136,12 @@ public class ChatStreamService {
 
         List<Message> messages = new ArrayList<>(selectMessages(conversationId));
 
+        Long existingReplyId = null;
         int lastIndex = messages.size() - 1;
         if (lastIndex >= 0 && ROLE_ASSISTANT.equals(messages.get(lastIndex).getRole())) {
-            messageMapper.deleteById(messages.get(lastIndex).getId());
+            existingReplyId = messages.get(lastIndex).getId();
+            // 只是从上下文里摘掉：它是本轮要覆盖的对象，不该作为历史发给模型。
+            // 尾条不是助手回复时（首轮提问后重生成）保持 null，本轮新写一条
             messages.remove(lastIndex);
         }
         if (messages.isEmpty() || !ROLE_USER.equals(messages.get(messages.size() - 1).getRole())) {
@@ -148,7 +153,7 @@ public class ChatStreamService {
         // 附件轮的提问正文可能是空串，必须把它当初的附件一并取回来——否则重新生成等于发了个空提问，
         // 答案与首次必然不同，而用户以为在重跑同一问
         List<Attachment> attachments = attachmentService.findByMessageId(lastUserMessage.getId());
-        return buildContext(conversation, userId, history, lastUserMessage, attachments);
+        return buildContext(conversation, userId, history, lastUserMessage, attachments, existingReplyId);
     }
 
     /**
@@ -180,10 +185,18 @@ public class ChatStreamService {
 
     private Flux<ChatEvent> replyFlux(ChatContext context, String knowledge) {
         List<ChatMessage> messages = assembleMessages(context, knowledge);
-        AtomicBoolean cancelled = new AtomicBoolean(false);
         return Flux.<ChatEvent>create(sink -> {
-                    sink.onCancel(() -> cancelled.set(true));
-                    requestModel(context, messages, sink, cancelled);
+                    ReplyState state = new ReplyState();
+                    sink.onCancel(() -> {
+                        // 客户端断开：用户点「停止生成」、切会话、关页面，服务端看到的都是这一条路。
+                        // 把断开那一刻已经生成的部分落库——用户看过这段内容，刷新后它不该凭空消失。
+                        // 快照可能比用户看到的略多（BUFFER 里还压着没发出去的增量），方向上无害
+                        String snapshot = state.cancelAndSnapshot();
+                        if (snapshot != null && !snapshot.isEmpty()) {
+                            saveReply(context, snapshot, Message.STATUS_INTERRUPTED);
+                        }
+                    });
+                    requestModel(context, messages, sink, state);
                 }, FluxSink.OverflowStrategy.BUFFER)
                 // 让模型调用与随后的落库都离开 Tomcat 请求线程
                 .subscribeOn(Schedulers.boundedElastic());
@@ -197,8 +210,7 @@ public class ChatStreamService {
     }
 
     private void requestModel(ChatContext context, List<ChatMessage> messages,
-                              FluxSink<ChatEvent> sink, AtomicBoolean cancelled) {
-        StringBuilder accumulated = new StringBuilder();
+                              FluxSink<ChatEvent> sink, ReplyState state) {
         try {
             streamingChatModel.chat(
                     ChatRequest.builder().messages(messages).build(),
@@ -206,63 +218,149 @@ public class ChatStreamService {
 
                         @Override
                         public void onPartialResponse(String token) {
-                            if (cancelled.get()) {
-                                return;
+                            // append 在客户端已断开时返回 false。sink.next 刻意留在它外面：
+                            // BUFFER 策略下这一句可能同步阻塞在往半死的连接写字节上
+                            if (state.append(token)) {
+                                sink.next(new ChatEvent.Delta(token));
                             }
-                            accumulated.append(token);
-                            sink.next(new ChatEvent.Delta(token));
                         }
 
                         @Override
                         public void onCompleteResponse(ChatResponse response) {
-                            if (cancelled.get()) {
-                                // 客户端已断开：按约定本次回复不落库
+                            String text = state.claim();
+                            if (text == null) {
+                                // 写入权已被取消路径取走：这一轮的内容早就不归这里管了
                                 sink.complete();
                                 return;
                             }
-                            persistReply(context, sink, accumulated.toString());
+                            if (text.isEmpty()) {
+                                sink.next(new ChatEvent.Failed("模型没有返回任何内容"));
+                                sink.complete();
+                                return;
+                            }
+                            Long messageId = saveReply(context, text, Message.STATUS_COMPLETED);
+                            sink.next(messageId == null
+                                    ? new ChatEvent.Failed("回复保存失败")
+                                    : new ChatEvent.Done(messageId));
+                            sink.complete();
                         }
 
                         @Override
                         public void onError(Throwable error) {
-                            if (cancelled.get()) {
-                                sink.complete();
-                                return;
-                            }
                             log.error("流式生成失败，conversationId={}", context.conversationId(), error);
-                            sink.next(new ChatEvent.Failed(briefReason(error)));
-                            sink.complete();
+                            failWith(context, sink, state, briefReason(error));
                         }
                     });
         } catch (Exception e) {
+            // chat(...) 自己抛异常。适配器也可能先推了几个增量再抛，所以这段同样要走落库
             log.error("调用模型失败，conversationId={}", context.conversationId(), e);
-            sink.next(new ChatEvent.Failed(briefReason(e)));
-            sink.complete();
+            failWith(context, sink, state, briefReason(e));
         }
     }
 
-    private void persistReply(ChatContext context, FluxSink<ChatEvent> sink, String text) {
-        if (text.isEmpty()) {
-            sink.next(new ChatEvent.Failed("模型没有返回任何内容"));
+    /**
+     * 以 error 事件收场，并把出错前已生成的部分落库为 {@code failed}。
+     *
+     * <p>一个字都没生成时什么都不写：空消息既没有展示价值，作为历史发给模型也会出问题。
+     */
+    private void failWith(ChatContext context, FluxSink<ChatEvent> sink,
+                          ReplyState state, String reason) {
+        String text = state.claim();
+        if (text == null) {
+            // 客户端已经断开，取消路径先把这一轮写走了
             sink.complete();
             return;
         }
+        if (!text.isEmpty()) {
+            saveReply(context, text, Message.STATUS_FAILED);
+        }
+        sink.next(new ChatEvent.Failed(reason));
+        // complete 而不是 error：响应提交之后再调 sink.error 会重新进入 Spring 的异常解析器，
+        // 可能把 JSON 错误体追加进已经开始输出的 SSE 流
+        sink.complete();
+    }
+
+    /**
+     * 落库一轮回复：重新生成时原地覆盖那条旧回复，否则新写一条。
+     *
+     * <p>判空留在调用方——「模型一个字没吐」与「写库失败」要给用户不同的文案，
+     * 收进来的话这个区别就没了。
+     *
+     * @param status 这一轮是怎么收场的，取值见 {@link Message} 的 {@code STATUS_*} 常量
+     * @return 落库后的消息 id；写库失败返回 null，由调用方决定怎么收场
+     */
+    private Long saveReply(ChatContext context, String text, String status) {
         try {
-            // 整条落库，绝不保存半截内容
-            Message assistantMessage = new Message();
-            assistantMessage.setConversationId(context.conversationId());
-            assistantMessage.setRole(ROLE_ASSISTANT);
-            assistantMessage.setContent(text);
-            messageMapper.insert(assistantMessage);
+            Long messageId;
+            if (context.existingReplyId() == null) {
+                Message reply = new Message();
+                reply.setConversationId(context.conversationId());
+                reply.setRole(ROLE_ASSISTANT);
+                reply.setContent(text);
+                reply.setStatus(status);
+                messageMapper.insert(reply);
+                messageId = reply.getId();
+            } else {
+                messageId = context.existingReplyId();
+                int updated = messageMapper.updateReply(messageId, context.conversationId(), text, status);
+                if (updated == 0) {
+                    // 那一行不在了（或已被别处删掉）：内容并没存下去，别让调用方以为写成功了
+                    log.warn("覆盖助手回复没有命中任何行：messageId={}, conversationId={}",
+                            messageId, context.conversationId());
+                    return null;
+                }
+            }
             conversationMapper.touch(context.conversationId(), context.userId());
-            sink.next(new ChatEvent.Done(assistantMessage.getId()));
+            return messageId;
         } catch (Exception e) {
             log.error("保存助手回复失败，conversationId={}", context.conversationId(), e);
-            sink.next(new ChatEvent.Failed("回复保存失败"));
+            return null;
         }
-        // 无论成败都是 complete 而不是 error：响应提交之后再调 sink.error 会重新进入
-        // Spring 的异常解析器，可能把 JSON 错误体追加进已经开始输出的 SSE 流
-        sink.complete();
+    }
+
+    /**
+     * 一轮生成的共享状态：累计正文、是否已被取消、这次写入归谁。
+     *
+     * <p>三个回调与取消信号可能来自不同线程（模型推送线程、容器察觉断开的线程、弹性池），
+     * 所以全部改动都收在这一个监视器里。刻意不把 {@code sink.next} 收进来——见
+     * {@code onPartialResponse} 的说明。
+     *
+     * <p>「谁写」由返回值决定：{@link #cancelAndSnapshot} 与 {@link #claim} 互斥，
+     * 只有一个能拿到非 null，所以半截内容与完整内容不会被写两次，也不需要额外的标记。
+     */
+    private static final class ReplyState {
+
+        private final StringBuilder accumulated = new StringBuilder();
+        private boolean cancelled;
+        private boolean claimed;
+
+        /** 追加一段增量；已被取消时返回 false，调用方据此跳过下发 */
+        synchronized boolean append(String token) {
+            if (cancelled) {
+                return false;
+            }
+            accumulated.append(token);
+            return true;
+        }
+
+        /** 客户端断开：置位并取走「断开那一刻」的快照；返回 null 表示这次写入已经不归取消路径 */
+        synchronized String cancelAndSnapshot() {
+            cancelled = true;
+            return claimLocked();
+        }
+
+        /** 生成结束（正常或报错）：取走快照并占住写入权；已被取消时返回 null */
+        synchronized String claim() {
+            return cancelled ? null : claimLocked();
+        }
+
+        private String claimLocked() {
+            if (claimed) {
+                return null;
+            }
+            claimed = true;
+            return accumulated.toString();
+        }
     }
 
     /**
@@ -288,7 +386,8 @@ public class ChatStreamService {
     }
 
     private ChatContext buildContext(Conversation conversation, long userId, List<Message> history,
-                                     Message userMessage, List<Attachment> userAttachments) {
+                                     Message userMessage, List<Attachment> userAttachments,
+                                     Long existingReplyId) {
         List<Message> recentHistory = trimToRecent(history);
         Map<Long, List<Attachment>> historyMedia = pickHistoryMedia(recentHistory, userAttachments);
 
@@ -313,7 +412,8 @@ public class ChatStreamService {
                 // 检索范围＝本会话内的全部文本附件，含本轮这条（刚绑定，已经带上 conversation_id）
                 attachmentService.listTextAttachmentIds(conversation.getId()),
                 titleNeeded,
-                titleSourceOf(userMessage, userAttachments));
+                titleSourceOf(userMessage, userAttachments),
+                existingReplyId);
     }
 
     /**

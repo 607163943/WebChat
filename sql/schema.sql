@@ -26,11 +26,14 @@ CREATE TABLE `tb_conversation` (
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '会话表';
 
 -- 消息表：一条记录代表会话中的一条消息，用户提问与 AI 回复同表，通过 role 区分
+-- status 只对助手消息有意义（用户消息恒为 completed）：生成中途失败或被打断时，
+-- 半截正文照样落库，靠这一列说明它没写完——否则刷新后它与一条完整回复长得一模一样
 CREATE TABLE `tb_message` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '消息ID',
     `conversation_id` bigint unsigned NOT NULL COMMENT '所属会话ID',
     `role` varchar(20) NOT NULL COMMENT '消息角色：user/assistant/system',
     `content` text NOT NULL COMMENT '消息正文',
+    `status` varchar(20) NOT NULL DEFAULT 'completed' COMMENT '消息状态：completed 正常结束 / interrupted 用户中断 / failed 生成失败',
     `create_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '发送时间',
     PRIMARY KEY (`id`),
     KEY `idx_conversation_id` (`conversation_id`, `id`)

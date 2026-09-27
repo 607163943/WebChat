@@ -26,6 +26,8 @@ import java.util.List;
  * @param retrievableAttachmentIds 本会话内可检索的文本附件 id，检索时按它过滤向量
  * @param titleNeeded             是否需要在这轮之后生成会话标题（新会话的首条消息）
  * @param titleSource             用于生成标题的用户提问原文；仅在 {@code titleNeeded} 为真时有意义
+ * @param existingReplyId         本轮要覆盖的既有助手回复 id，只有「重新生成」会带上；为 null 表示新写一条。
+ *                                这一条已经被摘出 {@code modelMessages}——它是被覆盖的对象，不该进上下文
  */
 public record ChatContext(
         Long conversationId,
@@ -36,5 +38,6 @@ public record ChatContext(
         String retrievalQuery,
         List<Long> retrievableAttachmentIds,
         boolean titleNeeded,
-        String titleSource) {
+        String titleSource,
+        Long existingReplyId) {
 }

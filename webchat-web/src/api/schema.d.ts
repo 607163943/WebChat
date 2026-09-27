@@ -129,7 +129,9 @@ export interface paths {
         /**
          * 发送消息（SSE 流式）
          * @description 返回 text/event-stream，不套 Result 信封。
-         *     事件协议：若干 delta → done →（仅新会话）title；生成失败则以 error 结束且本次回复不落库。
+         *     事件协议：若干 delta → done →（仅新会话）title；生成失败则以 error 结束。
+         *     助手回复在三种收场下都会落库：正常结束 completed、生成出错 failed、用户中断 interrupted；
+         *     出错与中断时存的是已生成的那部分，一个字都没生成则不落库。
          *     每条事件都必须带 event 名，事件体均为 JSON。
          */
         post: operations["send"];
@@ -150,7 +152,8 @@ export interface paths {
         put?: never;
         /**
          * 重新生成（SSE 流式）
-         * @description 删除该会话最后一条助手回复，用其前面那条用户消息重新生成——用户消息不会重复插入。
+         * @description 用该会话最后一条助手回复前面的那条用户消息重新生成，正文原地覆盖最后一条助手回复
+         *     （id 不变、不新增行）——用户消息不会重复插入，连点两次也是安全的。
          *     事件协议与「发送消息」完全一致。
          */
         post: operations["regenerate"];
@@ -188,6 +191,7 @@ export interface components {
             /** Format: int64 */
             id?: number;
             role?: string;
+            status?: string;
         };
         ResultAttachmentVO: {
             /** Format: int32 */

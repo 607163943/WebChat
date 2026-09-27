@@ -30,11 +30,15 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.util.unit.DataSize;
+import reactor.core.Disposable;
 
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -63,6 +67,8 @@ class ChatStreamServiceTests {
     private static final long CONVERSATION_ID = 1L;
     /** 落库时回填给助手消息的 id，与用户消息那个分开，便于断言 done 事件带的是哪一个 */
     private static final long ASSISTANT_MESSAGE_ID = 50L;
+    /** 重新生成时被覆盖的那条旧回复的 id */
+    private static final long EXISTING_REPLY_ID = 30L;
 
     @Mock
     private StreamingChatModel streamingChatModel;
@@ -141,6 +147,38 @@ class ChatStreamServiceTests {
         });
     }
 
+    /** 同上，另外在真的写库那一下放行一个闩——取消路径的落库是异步的，测试只能等它 */
+    private void assistantInsertReturns(long id, CountDownLatch saved) {
+        when(messageMapper.insert(any(Message.class))).thenAnswer(invocation -> {
+            ((Message) invocation.getArgument(0)).setId(id);
+            saved.countDown();
+            return 1;
+        });
+    }
+
+    /** 全轮唯一一次落库的那条助手消息——顺带钉住「只写一次」 */
+    private Message singleSavedReply() {
+        ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
+        verify(messageMapper).insert(captor.capture());
+        return captor.getValue();
+    }
+
+    /**
+     * 让假的模型只把 handler 交出来、不吐字：什么时候吐、什么时候断都由测试线程决定。
+     *
+     * <p>真实的取消由容器察觉客户端断开后触发，测试里只能自己制造——先拿到 handler，
+     * 手动推一个增量，再取消订阅。
+     */
+    private AtomicReference<StreamingChatResponseHandler> captureHandler(CountDownLatch called) {
+        AtomicReference<StreamingChatResponseHandler> handler = new AtomicReference<>();
+        doAnswer(invocation -> {
+            handler.set(invocation.getArgument(1));
+            called.countDown();
+            return null;
+        }).when(streamingChatModel).chat(any(ChatRequest.class), any(StreamingChatResponseHandler.class));
+        return handler;
+    }
+
     private List<ChatEvent> collect(ChatContext context) {
         return service.stream(context).collectList().block();
     }
@@ -157,18 +195,30 @@ class ChatStreamServiceTests {
         return (UserMessage) messages.get(messages.size() - 1);
     }
 
-    /** 造一个「事件编排」用例用的 context：没有附件、不检索 */
+    /** 造一个「事件编排」用例用的 context：没有附件、不检索、不覆盖既有回复 */
     private static ChatContext contextOf(boolean titleNeeded, String titleSource) {
         return new ChatContext(1L, 7L, MODEL_MESSAGES, userMessage("你好"), List.of(),
-                "你好", List.of(), titleNeeded, titleSource);
+                "你好", List.of(), titleNeeded, titleSource, null);
+    }
+
+    /** 造一个「重新生成」用例用的 context：本轮要覆盖 id 为 30 的那条旧回复 */
+    private static ChatContext regenerateContextOf() {
+        return new ChatContext(1L, 7L, MODEL_MESSAGES, userMessage("你好"), List.of(),
+                "你好", List.of(), false, "你好", EXISTING_REPLY_ID);
     }
 
     private static Message userMessage(String content) {
+        return messageRow(8L, "user", content);
+    }
+
+    /** 库里已有的一行 */
+    private static Message messageRow(long id, String role, String content) {
         Message message = new Message();
-        message.setId(8L);
-        message.setConversationId(1L);
-        message.setRole("user");
+        message.setId(id);
+        message.setConversationId(CONVERSATION_ID);
+        message.setRole(role);
         message.setContent(content);
+        message.setStatus(Message.STATUS_COMPLETED);
         return message;
     }
 
@@ -242,8 +292,8 @@ class ChatStreamServiceTests {
     }
 
     @Test
-    @DisplayName("模型中途报错：发 error 事件，且助手回复不落库")
-    void emitsErrorAndSkipsPersistence() {
+    @DisplayName("模型中途报错：发 error 事件，但出错前已生成的部分以 failed 落库")
+    void keepsPartialReplyWhenModelFails() {
         modelFailsAfter("半截", new RuntimeException("模型挂了"));
 
         List<ChatEvent> events = collect(contextOf(false, "你好"));
@@ -251,7 +301,9 @@ class ChatStreamServiceTests {
         assertThat(events).hasSize(2);
         assertThat(events.get(0)).isEqualTo(new ChatEvent.Delta("半截"));
         assertThat(events.get(1)).isInstanceOf(ChatEvent.Failed.class);
-        verify(messageMapper, never()).insert(any(Message.class));
+        // 用户已经看见这半句了，丢掉它等于刷新后内容凭空消失
+        assertThat(singleSavedReply().getContent()).isEqualTo("半截");
+        assertThat(singleSavedReply().getStatus()).isEqualTo(Message.STATUS_FAILED);
     }
 
     @Test
@@ -264,6 +316,18 @@ class ChatStreamServiceTests {
         assertThat(events).hasSize(1);
         assertThat(events.get(0)).isInstanceOf(ChatEvent.Failed.class);
         verify(messageMapper, never()).insert(any(Message.class));
+        verify(messageMapper, never()).updateReply(anyLong(), anyLong(), anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("正常结束：回复以 completed 落库")
+    void savesCompletedStatusOnNormalCompletion() {
+        modelEmits("好");
+        assistantInsertReturns(48L);
+
+        collect(contextOf(false, "你好"));
+
+        assertThat(singleSavedReply().getStatus()).isEqualTo(Message.STATUS_COMPLETED);
     }
 
     @Test
@@ -275,6 +339,124 @@ class ChatStreamServiceTests {
         collect(contextOf(false, "你好"));
 
         verify(conversationMapper).touch(1L, 7L);
+    }
+
+    // ---------------------------------------------------------------- 重新生成
+
+    @Test
+    @DisplayName("重新生成：原地覆盖那条旧回复，既不删也不新插")
+    void regenerateOverwritesExistingReply() {
+        modelEmits("新答案");
+        when(messageMapper.updateReply(EXISTING_REPLY_ID, CONVERSATION_ID, "新答案",
+                Message.STATUS_COMPLETED)).thenReturn(1);
+
+        List<ChatEvent> events = collect(regenerateContextOf());
+
+        assertThat(events).containsExactly(new ChatEvent.Delta("新答案"),
+                new ChatEvent.Done(EXISTING_REPLY_ID));
+        verify(messageMapper).updateReply(EXISTING_REPLY_ID, CONVERSATION_ID, "新答案",
+                Message.STATUS_COMPLETED);
+        verify(messageMapper, never()).insert(any(Message.class));
+        verify(messageMapper, never()).deleteById(anyLong());
+    }
+
+    @Test
+    @DisplayName("重新生成中途报错：半截内容照样覆盖上去，状态是 failed")
+    void regenerateMarksFailureOnExistingReply() {
+        modelFailsAfter("半截", new RuntimeException("模型挂了"));
+        when(messageMapper.updateReply(EXISTING_REPLY_ID, CONVERSATION_ID, "半截",
+                Message.STATUS_FAILED)).thenReturn(1);
+
+        collect(regenerateContextOf());
+
+        verify(messageMapper).updateReply(EXISTING_REPLY_ID, CONVERSATION_ID, "半截",
+                Message.STATUS_FAILED);
+        verify(messageMapper, never()).insert(any(Message.class));
+    }
+
+    @Test
+    @DisplayName("重新生成一个字都没产出：旧回复原样不动")
+    void regenerateLeavesExistingReplyWhenNothingGenerated() {
+        modelEmits();
+
+        collect(regenerateContextOf());
+
+        verify(messageMapper, never()).updateReply(anyLong(), anyLong(), anyString(), anyString());
+        verify(messageMapper, never()).insert(any(Message.class));
+    }
+
+    @Test
+    @DisplayName("重新生成的上下文：尾条助手回复的 id 被记下，且它不再作为历史发给模型")
+    void regenerateTargetsTrailingReply() {
+        when(currentUserProvider.userId()).thenReturn(USER_ID);
+        when(conversationService.requireOwned(CONVERSATION_ID)).thenReturn(conversation("已命名"));
+        when(messageMapper.selectList(any(Wrapper.class))).thenReturn(new ArrayList<>(List.of(
+                messageRow(7L, "user", "第二问"), messageRow(8L, "assistant", "要覆盖的答"))));
+        when(attachmentService.findByMessageId(7L)).thenReturn(List.of());
+
+        ChatContext context = service.prepareRegenerate(CONVERSATION_ID);
+
+        assertThat(context.existingReplyId()).isEqualTo(8L);
+        // 历史为空：那条提问是本轮提问、那条助手回复是本轮要覆盖的对象，两者都不该进上下文
+        assertThat(context.modelMessages()).hasSize(1);
+        assertThat(context.modelMessages().get(0)).isInstanceOf(SystemMessage.class);
+        verify(messageMapper, never()).deleteById(anyLong());
+    }
+
+    @Test
+    @DisplayName("重新生成时尾条不是助手回复：本轮没有可覆盖的行")
+    void regenerateWithoutTrailingReplyHasNothingToOverwrite() {
+        when(currentUserProvider.userId()).thenReturn(USER_ID);
+        when(conversationService.requireOwned(CONVERSATION_ID)).thenReturn(conversation("已命名"));
+        when(messageMapper.selectList(any(Wrapper.class)))
+                .thenReturn(new ArrayList<>(List.of(messageRow(7L, "user", "只问过"))));
+        when(attachmentService.findByMessageId(7L)).thenReturn(List.of());
+
+        assertThat(service.prepareRegenerate(CONVERSATION_ID).existingReplyId()).isNull();
+    }
+
+    // ---------------------------------------------------------------- 客户端断开
+
+    @Test
+    @DisplayName("客户端断开：把断开那一刻已生成的部分以 interrupted 落库")
+    void keepsPartialReplyWhenClientDisconnects() throws Exception {
+        CountDownLatch modelCalled = new CountDownLatch(1);
+        AtomicReference<StreamingChatResponseHandler> handler = captureHandler(modelCalled);
+        CountDownLatch saved = new CountDownLatch(1);
+        assistantInsertReturns(60L, saved);
+
+        Disposable subscription = service.stream(contextOf(false, "你好")).subscribe();
+        // 先等到 chat 真的被调过：sink.onCancel 的注册排在它之前，注册完再取消才传得到那个回调
+        assertThat(modelCalled.await(5, TimeUnit.SECONDS)).isTrue();
+        handler.get().onPartialResponse("半截");
+        subscription.dispose();
+        // 取消（以及随后的落库）跑在弹性池上，别假设 dispose() 返回时就写完了
+        assertThat(saved.await(5, TimeUnit.SECONDS)).isTrue();
+
+        Message reply = singleSavedReply();
+        assertThat(reply.getContent()).isEqualTo("半截");
+        assertThat(reply.getStatus()).isEqualTo(Message.STATUS_INTERRUPTED);
+    }
+
+    @Test
+    @DisplayName("断开之后模型才走到完成：这一轮不会再被写第二遍")
+    void doesNotWriteTwiceWhenModelCompletesAfterDisconnect() throws Exception {
+        CountDownLatch modelCalled = new CountDownLatch(1);
+        AtomicReference<StreamingChatResponseHandler> handler = captureHandler(modelCalled);
+        CountDownLatch saved = new CountDownLatch(1);
+        assistantInsertReturns(61L, saved);
+
+        Disposable subscription = service.stream(contextOf(false, "你好")).subscribe();
+        assertThat(modelCalled.await(5, TimeUnit.SECONDS)).isTrue();
+        handler.get().onPartialResponse("半截");
+        subscription.dispose();
+        assertThat(saved.await(5, TimeUnit.SECONDS)).isTrue();
+        // 真实适配器停不下来，断开之后仍可能走完成回调。这次晚到的调用必须被吞掉：
+        // singleSavedReply() 断言全轮只 insert 过一次，重复写会让它失败
+        handler.get().onCompleteResponse(null);
+
+        assertThat(singleSavedReply().getStatus()).isEqualTo(Message.STATUS_INTERRUPTED);
+        verify(messageMapper, never()).updateReply(anyLong(), anyLong(), anyString(), anyString());
     }
 
     // ---------------------------------------------------------------- 附件与多模态
@@ -466,7 +648,7 @@ class ChatStreamServiceTests {
                 .thenReturn("【片段 1｜来源：纪要.txt】\n季度目标");
 
         collect(new ChatContext(1L, 7L, MODEL_MESSAGES, userMessage("它讲了什么"), List.of(),
-                "它讲了什么", List.of(104L), false, "它讲了什么"));
+                "它讲了什么", List.of(104L), false, "它讲了什么", null));
 
         List<ChatMessage> messages = sentMessages();
         // 资料跟着问题走，不动 system 提示词——合并进 system 会破坏 DashScope 的前缀缓存，
@@ -501,7 +683,7 @@ class ChatStreamServiceTests {
                 .thenThrow(new RuntimeException("embedding 服务不可用"));
 
         List<ChatEvent> events = collect(new ChatContext(1L, 7L, MODEL_MESSAGES, userMessage("你好"),
-                List.of(), "你好", List.of(100L), false, "你好"));
+                List.of(), "你好", List.of(100L), false, "你好", null));
 
         assertThat(events).containsExactly(new ChatEvent.Delta("好"), new ChatEvent.Done(51L));
         assertThat(events).noneMatch(ChatEvent.Failed.class::isInstance);

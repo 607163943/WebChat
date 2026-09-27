@@ -56,6 +56,19 @@ async function copy(): Promise<void> {
     <MarkdownContent :content="props.message.content" />
 
     <div class="mt-2.5 flex items-center gap-1.5">
+      <!-- 没写完的回复：后端照样落了库，这里说清它为什么短一截，否则刷新后它和一条完整回复长得一样 -->
+      <span
+        v-if="props.message.status !== 'completed'"
+        class="bg-muted text-muted-foreground mr-1 shrink-0 rounded-full px-2 py-0.5 text-[11.5px]"
+        :title="
+          props.message.status === 'interrupted'
+            ? '生成已中断，这里是中断前已生成的部分'
+            : '生成出错，这里是出错前已生成的部分'
+        "
+      >
+        {{ props.message.status === 'interrupted' ? '已中断' : '生成失败' }}
+      </span>
+
       <button
         type="button"
         class="hover:bg-muted hover:text-fg-secondary text-muted-foreground flex h-[27px] items-center gap-[5px] rounded-md px-2 text-[12px] transition-colors"

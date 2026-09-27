@@ -156,7 +156,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   resizeObserver?.disconnect()
-  // 页面离开时中断流式请求：后端会因此判定为「客户端断开」，本次回复不落库
+  // 页面离开时中断流式请求：后端会因此判定为「客户端断开」，并把已生成的部分落库为 interrupted
   chat.abortStream()
 })
 </script>

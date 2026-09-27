@@ -11,7 +11,7 @@ import {
 } from '@/api/conversations'
 import { deleteAttachment as deleteAttachmentApi, uploadAttachment } from '@/api/attachments'
 import { ApiError } from '@/api/http'
-import type { Attachment, ChatMessage, Conversation } from '@/api/types'
+import type { Attachment, ChatMessage, Conversation, MessageStatus } from '@/api/types'
 import type { AttachmentKind } from '@/lib/attachments'
 import { MAX_FILES_PER_MESSAGE, classify, validateFile } from '@/lib/attachments'
 
@@ -243,7 +243,7 @@ export const useChatStore = defineStore('chat', () => {
     // 后端在收到消息时就会落库，本地先乐观插入，省掉一次往返。
     // 附件也要跟着插进去，否则「只发附件」的那条在发送瞬间就是个空气泡
     messages.value.push(localMessage('user', text, pending))
-    const accepted = await runStream(
+    const { accepted } = await runStream(
       (handlers, signal) =>
         sendMessageApi(
           conversationId,
@@ -269,12 +269,21 @@ export const useChatStore = defineStore('chat', () => {
     if (conversationId === null || streaming.value) {
       return
     }
-    // 后端会删掉最后一条助手回复，本地同步移除，避免流式期间同一条显示两遍
+    // 后端会把新内容覆盖到这条回复上（不再删了重插），本地先摘掉它，避免流式期间同一条显示两遍。
+    // 摘下来的要留着：这一轮一个字都没产出时后端根本没动那一行，得把它放回去，
+    // 否则界面上会少一条库里确实存在的消息
     const last = messages.value[messages.value.length - 1]
-    if (last?.role === 'assistant') {
-      messages.value.pop()
+    const removed = last?.role === 'assistant' ? messages.value.pop() : undefined
+
+    const { replied } = await runStream((handlers, signal) =>
+      regenerateApi(conversationId, handlers, signal),
+    )
+
+    // 生成期间用户可能已切到别的会话：那时候 messages 里装的是别人的消息，
+    // 把 removed 放回去等于把上一条会话的回复插进了这一条
+    if (!replied && removed && currentId.value === conversationId) {
+      messages.value.push(removed)
     }
-    await runStream((handlers, signal) => regenerateApi(conversationId, handlers, signal))
   }
 
   function clearError(): void {
@@ -381,19 +390,24 @@ export const useChatStore = defineStore('chat', () => {
   /**
    * 跑一轮流式请求。
    *
-   * @returns 请求是否被后端收下。false 表示它压根没到后端，本轮服务端不留任何数据，
+   * @returns accepted 请求是否被后端收下。false 表示它压根没到后端，本轮服务端不留任何数据，
    *   调用方据此决定要不要把为这次发送而新建的会话也撤掉。
+   *   replied 本轮是否已经有一条助手回复进了 messages——完整的、以及失败或中断后留下的半截都算。
+   *   「重新生成」靠它决定要不要把先前摘下来的那条旧回复放回去。
    */
   async function runStream(
     start: (handlers: ChatStreamHandlers, signal: AbortSignal) => Promise<void>,
     sentText: string | null = null,
-  ): Promise<boolean> {
+  ): Promise<{ accepted: boolean; replied: boolean }> {
     const controller = new AbortController()
     abortController = controller
+    /** 本轮属于哪个会话：半截回复只该落在它自己那个会话的列表里 */
+    const streamConversationId = currentId.value
     streaming.value = true
     streamingText.value = ''
     errorMessage.value = ''
     let failed = false
+    let replied = false
     /**
      * 请求是否被后端收下（收下了就意味着用户消息已落库）。
      *
@@ -401,22 +415,61 @@ export const useChatStore = defineStore('chat', () => {
      * 单方面断开，请求早就发出去了，用户消息同样在库里。
      */
     let accepted = true
+    /**
+     * 本轮的累计正文。
+     *
+     * 刻意用局部变量而不是读 streamingText：后者是给视图用的，abortStream 会立刻清空它
+     * （空状态与流式气泡都靠它判断），而「有没有半截内容」这个判据必须在清空之后依然成立。
+     */
+    let produced = ''
+
+    /**
+     * 把累计正文变成一条正式消息。
+     *
+     * 失败与中断共用这里：两种情况下后端都已经把这段内容落了库（failed / interrupted），
+     * 本地跟着留下，刷新前后才一致。
+     */
+    function keepPartial(status: MessageStatus): void {
+      // 一个字都没吐就没什么可留的，后端同样不会写这条空消息
+      if (produced === '') {
+        return
+      }
+      // 用户已经切走的那个会话：这段内容不属于眼下这个列表，库里那条等他下次打开时出现
+      if (currentId.value !== streamConversationId) {
+        return
+      }
+      messages.value.push({
+        // 负数 id 与乐观插入的用户消息同一套路，只用于 v-for 的 key 与「哪条能重新生成」，
+        // 真实 id 在下次拉取消息时补齐
+        id: -Date.now(),
+        role: 'assistant',
+        content: produced,
+        createTime: new Date().toISOString(),
+        // 助手回复不带附件，但结构上这个字段是必填的
+        attachments: [],
+        status,
+      })
+      replied = true
+    }
 
     try {
       await start(
         {
           onDelta: (chunk) => {
+            produced += chunk
             streamingText.value += chunk
           },
           onDone: (messageId) => {
             messages.value.push({
               id: messageId,
               role: 'assistant',
-              content: streamingText.value,
+              content: produced,
               createTime: new Date().toISOString(),
               // 助手回复不带附件，但结构上这个字段是必填的
               attachments: [],
+              status: 'completed',
             })
+            replied = true
             streamingText.value = ''
           },
           onTitle: (title, conversationId) => {
@@ -437,7 +490,11 @@ export const useChatStore = defineStore('chat', () => {
       )
     } finally {
       streaming.value = false
-      // 失败时丢弃半截内容——后端同样不会落库，留着会让刷新后前后不一致
+      // 已经生成的半截内容不能再丢：后端在出错与断开两种收场下都把它落了库，
+      // 本地丢掉就会出现「刷新一下内容自己冒出来」的错位
+      if (!replied) {
+        keepPartial(failed ? 'failed' : 'interrupted')
+      }
       streamingText.value = ''
       if (abortController === controller) {
         abortController = null
@@ -445,6 +502,7 @@ export const useChatStore = defineStore('chat', () => {
       // 生成失败时把用户刚发的内容放回输入框，省得重新敲一遍。
       // 仅限「发送消息」这条路径：手动停止不算失败（用户消息已发出，还回去会造成重复提问），
       // regenerate 也没有输入框内容可还。
+      // 这段必须排在 keepPartial 之后不影响它：请求没到后端时 produced 必为空串，推不出半截消息
       if (failed && sentText !== null) {
         if (!accepted) {
           // 请求压根没到后端，刚才乐观插入的那条用户消息并不存在，必须撤掉，
@@ -461,19 +519,28 @@ export const useChatStore = defineStore('chat', () => {
       }
       await refreshConversations()
     }
-    return accepted
+    return { accepted, replied }
   }
 
   /**
    * 手动停止本次生成。
    *
    * 与失败不同：用户消息已经发出并落库，所以不把内容还回输入框（否则重发会重复提问）。
-   * 半截回复同样丢弃——后端不会落库，留着刷新后就没了。
+   * 已经生成的部分不再丢掉——后端会把它作为 interrupted 落库，收尾时 runStream 会把它
+   * 留成一条正式消息。
    */
   function stopStreaming(): void {
     abortStream()
   }
 
+  /**
+   * 中断当前流：切会话、删会话、离开页面都走这里。
+   *
+   * 对后端而言这与「用户点停止」是同一条路（客户端断开，都会被落库成 interrupted），
+   * 区别只在本地要不要把半截留在当前列表里——那个判断在 runStream 收尾时按 currentId 做，
+   * 不在这里。这里只负责断流并把流式状态收干净（isConversationEmpty 依赖 streamingText
+   * 被清空，否则新建对话的空状态会闪一下）。
+   */
   function abortStream(): void {
     abortController?.abort()
     abortController = null
@@ -501,7 +568,15 @@ export const useChatStore = defineStore('chat', () => {
     attachments: Attachment[] = [],
   ): ChatMessage {
     // 负数 ID 只用于 v-for 的 key，真实 ID 在下次拉取会话消息时补齐
-    return { id: -Date.now(), role, content, createTime: new Date().toISOString(), attachments }
+    return {
+      id: -Date.now(),
+      role,
+      content,
+      createTime: new Date().toISOString(),
+      attachments,
+      // 本地造出来的消息都是用户发出去的，不涉及生成状态
+      status: 'completed',
+    }
   }
 
   return {

@@ -87,8 +87,8 @@ public class ConversationServiceImpl implements ConversationService {
         Map<Long, List<AttachmentVO>> attachments = attachmentService.listByMessageIds(
                 rows.stream().map(Message::getId).toList());
         return rows.stream()
-                .map(m -> new MessageVO(m.getId(), m.getRole(), m.getContent(), m.getCreateTime(),
-                        attachments.getOrDefault(m.getId(), List.of())))
+                .map(m -> new MessageVO(m.getId(), m.getRole(), m.getContent(), m.getStatus(),
+                        m.getCreateTime(), attachments.getOrDefault(m.getId(), List.of())))
                 .toList();
     }
 
