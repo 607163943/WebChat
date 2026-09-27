@@ -1,6 +1,8 @@
 package com.webchat.config;
 
 import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.web.servlet.config.annotation.AsyncSupportConfigurer;
 import org.springframework.web.servlet.config.annotation.CorsRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
@@ -10,6 +12,10 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 @Configuration
 public class WebMvcConfig implements WebMvcConfigurer {
 
+    /**
+     * 配置CORS
+     * @param registry 跨域注册表
+     */
     @Override
     public void addCorsMappings(CorsRegistry registry) {
         registry.addMapping("/**")
@@ -21,5 +27,20 @@ public class WebMvcConfig implements WebMvcConfigurer {
                 // 尚无登录态，不携带凭证，配置保持与实际一致
                 .allowCredentials(false)
                 .maxAge(3600);
+    }
+
+    /**
+     * 配置异步支持，指定线程池
+     * @param configurer 异步支持配置器
+     */
+    @Override
+    public void configureAsyncSupport(AsyncSupportConfigurer configurer) {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(16);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix("mvc-async-");
+        executor.initialize();
+        configurer.setTaskExecutor(executor);
     }
 }
