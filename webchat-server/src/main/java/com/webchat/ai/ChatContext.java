@@ -1,8 +1,6 @@
 package com.webchat.ai;
 
-import com.webchat.entity.Attachment;
-import com.webchat.entity.Message;
-import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.Content;
 
 import java.util.List;
 
@@ -12,29 +10,27 @@ import java.util.List;
  * <p>把「准备」与「流式」拆开的目的是：准备阶段的任何失败都还发生在响应提交之前，
  * 可以被全局异常处理转成普通的 JSON 错误响应；一旦开始流式输出，就只能走 error 事件了。
  *
- * <p><b>本轮提问刻意不在 {@code modelMessages} 里</b>：文档检索是异步阶段才做的，检索到的片段要作为
- * 本轮提问的第一段文本注入——所以要等检索结果出来，再调
- * {@code ChatStreamService} 里的组装方法把它拼成完整的消息列表。历史消息不受影响，
- * 它们每一轮都是现场从库里重新渲染的。
+ * <p><b>历史不在这里</b>：它由 prepare 直接灌进该会话的记忆槽位（见
+ * {@link ChatStreamService} 的 buildContext），调用 AIService 时由框架自己取出、并在尾部补上本轮提问。
+ * 这里只带「本轮独有的东西」。
  *
- * @param conversationId          会话 ID
- * @param userId                  所属用户，用于刷新会话活跃时间时做归属校验
- * @param modelMessages           真正发给模型的固定部分（系统提示词 + 截断后的历史）
- * @param currentMessage          本轮用户消息（实体），附件与检索片段都由它派生
- * @param currentAttachments      本轮附件，可能为空
- * @param retrievalQuery          用于检索的提问文本；只带附件没打字时为空串，此时不检索
- * @param retrievableAttachmentIds 本会话内可检索的文本附件 id，检索时按它过滤向量
- * @param titleNeeded             是否需要在这轮之后生成会话标题（新会话的首条消息）
- * @param titleSource             用于生成标题的用户提问原文；仅在 {@code titleNeeded} 为真时有意义
- * @param existingReplyId         本轮要覆盖的既有助手回复 id，只有「重新生成」会带上；为 null 表示新写一条。
- *                                这一条已经被摘出 {@code modelMessages}——它是被覆盖的对象，不该进上下文
+ * <p><b>本轮提问的内容已经组装好了</b>，唯独检索到的资料不在其中：检索要调 embedding、只能在流式阶段做，
+ * 拿到之后再拼到最前面（见 {@link ChatStreamService#stream}）。
+ *
+ * @param conversationId           会话 ID，同时是记忆的槽位号
+ * @param userId                   所属用户，用于刷新会话活跃时间时做归属校验
+ * @param currentContents          本轮提问的内容（正文 + 文本附件说明 + 媒体），顺序见
+ *                                 {@link ChatMessageAssembler#renderQuestion}
+ * @param retrievalQuery           用于检索的提问文本；只带附件没打字时为空串，此时不检索
+ * @param retrievableAttachmentIds 本会话内可检索的文本附件 ID，检索时按它过滤向量
+ * @param titleNeeded              是否需要在这轮之后生成会话标题（新会话的首条消息）
+ * @param titleSource              用于生成标题的用户提问原文；仅在 {@code titleNeeded} 为真时有意义
+ * @param existingReplyId          本轮要覆盖的既有助手回复 ID，只有「重新生成」会带上；为 null 表示新写一条
  */
 public record ChatContext(
         Long conversationId,
         Long userId,
-        List<ChatMessage> modelMessages,
-        Message currentMessage,
-        List<Attachment> currentAttachments,
+        List<Content> currentContents,
         String retrievalQuery,
         List<Long> retrievableAttachmentIds,
         boolean titleNeeded,

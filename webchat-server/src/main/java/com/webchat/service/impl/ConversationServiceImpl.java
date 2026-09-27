@@ -1,6 +1,7 @@
 package com.webchat.service.impl;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.webchat.ai.ConversationMemoryStore;
 import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
@@ -27,6 +28,7 @@ public class ConversationServiceImpl implements ConversationService {
 
     private final ConversationMapper conversationMapper;
     private final MessageMapper messageMapper;
+    private final ConversationMemoryStore memoryStore;
     private final AttachmentService attachmentService;
     private final DocumentIndexService documentIndexService;
     private final CurrentUserProvider currentUserProvider;
@@ -73,6 +75,10 @@ public class ConversationServiceImpl implements ConversationService {
         documentIndexService.forgetAll(attachmentService.listTextAttachmentIds(id));
         messageMapper.delete(Wrappers.<Message>lambdaQuery().eq(Message::getConversationId, id));
         conversationMapper.deleteById(id);
+        // 对应的记忆槽位也清掉。消息都删了，槽位里那份渲染结果不该留在堆里——
+        // 下一条消息若带着同一个 id 进来（自增 id 不会复用，但别把这件事寄托在它上面），
+        // 也用不上它：记忆每轮都由 prepare 重建
+        memoryStore.deleteMessages(id);
     }
 
     @Override

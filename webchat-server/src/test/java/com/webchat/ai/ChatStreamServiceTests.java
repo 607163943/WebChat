@@ -13,20 +13,17 @@ import com.webchat.mapper.ConversationMapper;
 import com.webchat.mapper.MessageMapper;
 import com.webchat.service.AttachmentService;
 import com.webchat.service.ConversationService;
+import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ImageContent;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.TextContent;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.data.message.VideoContent;
-import dev.langchain4j.model.chat.StreamingChatModel;
-import dev.langchain4j.model.chat.request.ChatRequest;
-import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.util.unit.DataSize;
@@ -46,7 +43,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
@@ -56,9 +52,9 @@ import static org.mockito.Mockito.when;
 /**
  * 流式对话编排的单元测试。
  *
- * <p>用假的 {@link StreamingChatModel} 驱动整个 Flux，覆盖几处最容易出错、又最难在手工联调中发现的约定：
- * 事件顺序、失败时不落库、标题失败不能污染已成功的回复，以及附件如何变成多模态消息。
- * 全程不联网、不消耗 API 额度、不碰数据库。
+ * <p>用假的 {@link FakeStreamingChatModel} 驱动整个 Flux——AIService 那一层是真的（记忆、消息组装
+ * 都走框架自己的实现），覆盖几处最容易出错、又最难在手工联调中发现的约定：事件顺序、失败时不落库、
+ * 标题失败不能污染已成功的回复，以及附件如何变成多模态消息。全程不联网、不消耗 API 额度、不碰数据库。
  */
 @ExtendWith(MockitoExtension.class)
 class ChatStreamServiceTests {
@@ -70,8 +66,6 @@ class ChatStreamServiceTests {
     /** 重新生成时被覆盖的那条旧回复的 id */
     private static final long EXISTING_REPLY_ID = 30L;
 
-    @Mock
-    private StreamingChatModel streamingChatModel;
     @Mock
     private ConversationMapper conversationMapper;
     @Mock
@@ -95,48 +89,24 @@ class ChatStreamServiceTests {
     private final RagProperties ragProperties = new RagProperties(
             5, 0.7, 1200, 200, 10000, Duration.ofSeconds(3));
 
-    /**
-     * 事件编排这些用例的输入：系统提示词 + 历史。**本轮提问不在这里**，
-     * 它在检索出结果之后才由 {@code assembleMessages} 拼上去。
-     */
-    private static final List<ChatMessage> MODEL_MESSAGES =
-            List.of(SystemMessage.from("系统提示词"), UserMessage.from("你好"));
-
+    private final FakeStreamingChatModel model = new FakeStreamingChatModel();
+    private final ConversationMemoryStore memoryStore = new ConversationMemoryStore();
     private ChatStreamService service;
 
     @BeforeEach
     void setUp() {
-        service = new ChatStreamService(streamingChatModel, conversationMapper, messageMapper,
-                conversationService, attachmentService, attachmentProperties,
-                currentUserProvider, titleGenerator, documentIndexService, ragProperties);
+        // 与 AssistantConfig 用同一处装配：记忆与消息组装都走真的框架实现，测试才说明得了问题。
+        // 装配写在 setUp 里而不是字段初始化里——@Mock 的字段要到这时才被注入
+        ChatMessageAssembler messageAssembler =
+                new ChatMessageAssembler(attachmentService, attachmentProperties);
+        ChatAssistant assistant = new AssistantConfig().chatAssistant(model, memoryStore);
+        service = new ChatStreamService(assistant, memoryStore, messageAssembler, conversationMapper,
+                messageMapper, conversationService, attachmentService, currentUserProvider,
+                titleGenerator, documentIndexService, ragProperties);
         // 检索默认返回「没有资料」：多数用例测的是事件编排，与 RAG 无关。
         // 必须显式 stub —— mock 默认返回 null，而 Mono.fromCallable 拿到 null 会变成空流，
-        // 表现是一次 delta 都收不到，排查起来会莫名其妙。
-        // lenient 是因为并非每个用例都会走到检索；也不能放进 collect()，那样会在
-        // 「用例把 knowledgeFor 改成抛异常」之后再调一次 when(...)，而 when 会先执行方法本身
+        // 表现是一次 delta 都收不到，排查起来会莫名其妙
         lenient().when(documentIndexService.knowledgeFor(any(), any())).thenReturn("");
-    }
-
-    /** 让模型依次吐出给定片段后正常结束 */
-    private void modelEmits(String... tokens) {
-        doAnswer(invocation -> {
-            StreamingChatResponseHandler handler = invocation.getArgument(1);
-            for (String token : tokens) {
-                handler.onPartialResponse(token);
-            }
-            // 实现累积的是 onPartialResponse 的片段，不使用 ChatResponse，传 null 即可
-            handler.onCompleteResponse(null);
-            return null;
-        }).when(streamingChatModel).chat(any(ChatRequest.class), any(StreamingChatResponseHandler.class));
-    }
-
-    private void modelFailsAfter(String token, Throwable error) {
-        doAnswer(invocation -> {
-            StreamingChatResponseHandler handler = invocation.getArgument(1);
-            handler.onPartialResponse(token);
-            handler.onError(error);
-            return null;
-        }).when(streamingChatModel).chat(any(ChatRequest.class), any(StreamingChatResponseHandler.class));
     }
 
     /** 落库时回填自增主键，模拟 MyBatis-Plus 的行为 */
@@ -158,36 +128,24 @@ class ChatStreamServiceTests {
 
     /** 全轮唯一一次落库的那条助手消息——顺带钉住「只写一次」 */
     private Message singleSavedReply() {
-        ArgumentCaptor<Message> captor = ArgumentCaptor.forClass(Message.class);
+        org.mockito.ArgumentCaptor<Message> captor =
+                org.mockito.ArgumentCaptor.forClass(Message.class);
         verify(messageMapper).insert(captor.capture());
         return captor.getValue();
     }
 
-    /**
-     * 让假的模型只把 handler 交出来、不吐字：什么时候吐、什么时候断都由测试线程决定。
-     *
-     * <p>真实的取消由容器察觉客户端断开后触发，测试里只能自己制造——先拿到 handler，
-     * 手动推一个增量，再取消订阅。
-     */
-    private AtomicReference<StreamingChatResponseHandler> captureHandler(CountDownLatch called) {
-        AtomicReference<StreamingChatResponseHandler> handler = new AtomicReference<>();
-        doAnswer(invocation -> {
-            handler.set(invocation.getArgument(1));
-            called.countDown();
-            return null;
-        }).when(streamingChatModel).chat(any(ChatRequest.class), any(StreamingChatResponseHandler.class));
-        return handler;
+    /** 手工构造 context 的用例跳过了 prepare，系统提示词得自己补进记忆——否则请求里根本没有它 */
+    private void seedSystemPrompt() {
+        memoryStore.seed(CONVERSATION_ID, List.of(SystemMessage.from(Prompt.SYSTEM_PROMPT)));
     }
 
     private List<ChatEvent> collect(ChatContext context) {
-        return service.stream(context).collectList().block();
+        return service.stream(context).collectList().block(Duration.ofSeconds(5));
     }
 
     /** 真正发给模型的消息列表 */
     private List<ChatMessage> sentMessages() {
-        ArgumentCaptor<ChatRequest> captor = ArgumentCaptor.forClass(ChatRequest.class);
-        verify(streamingChatModel).chat(captor.capture(), any(StreamingChatResponseHandler.class));
-        return captor.getValue().messages();
+        return model.sentMessages();
     }
 
     /** 发出去的最后一条就是本轮提问 */
@@ -197,14 +155,14 @@ class ChatStreamServiceTests {
 
     /** 造一个「事件编排」用例用的 context：没有附件、不检索、不覆盖既有回复 */
     private static ChatContext contextOf(boolean titleNeeded, String titleSource) {
-        return new ChatContext(1L, 7L, MODEL_MESSAGES, userMessage("你好"), List.of(),
-                "你好", List.of(), titleNeeded, titleSource, null);
+        return new ChatContext(1L, 7L, List.of(TextContent.from("你好")), "你好", List.of(),
+                titleNeeded, titleSource, null);
     }
 
     /** 造一个「重新生成」用例用的 context：本轮要覆盖 id 为 30 的那条旧回复 */
     private static ChatContext regenerateContextOf() {
-        return new ChatContext(1L, 7L, MODEL_MESSAGES, userMessage("你好"), List.of(),
-                "你好", List.of(), false, "你好", EXISTING_REPLY_ID);
+        return new ChatContext(1L, 7L, List.of(TextContent.from("你好")), "你好", List.of(),
+                false, "你好", EXISTING_REPLY_ID);
     }
 
     private static Message userMessage(String content) {
@@ -227,7 +185,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("新会话：若干 delta → done → title，顺序由结构保证")
     void emitsDeltaThenDoneThenTitle() {
-        modelEmits("你", "好");
+        model.emits("你", "好");
         assistantInsertReturns(42L);
         when(titleGenerator.generate("你好")).thenReturn(Optional.of("问候"));
 
@@ -244,7 +202,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("非首条消息不发 title 事件，也不去调模型生成标题")
     void skipsTitleWhenNotNeeded() {
-        modelEmits("好");
+        model.emits("好");
         assistantInsertReturns(43L);
 
         List<ChatEvent> events = collect(contextOf(false, "你好"));
@@ -256,7 +214,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("标题为空时不发 title 事件")
     void skipsTitleEventWhenTitleIsEmpty() {
-        modelEmits("好");
+        model.emits("好");
         assistantInsertReturns(44L);
         when(titleGenerator.generate(anyString())).thenReturn(Optional.empty());
 
@@ -268,7 +226,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("标题生成抛异常时，已落库的回复仍然是 done 而不是 error")
     void titleFailureDoesNotTurnSuccessIntoError() {
-        modelEmits("好");
+        model.emits("好");
         assistantInsertReturns(45L);
         when(titleGenerator.generate(anyString())).thenThrow(new RuntimeException("标题服务不可用"));
 
@@ -281,10 +239,11 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("写入标题失败同样不影响 done")
     void updateTitleFailureDoesNotBreakStream() {
-        modelEmits("好");
+        model.emits("好");
         assistantInsertReturns(46L);
         when(titleGenerator.generate(anyString())).thenReturn(Optional.of("问候"));
-        doThrow(new RuntimeException("库挂了")).when(conversationMapper).updateTitle(anyLong(), anyLong(), anyString());
+        doThrow(new RuntimeException("库挂了")).when(conversationMapper)
+                .updateTitle(anyLong(), anyLong(), anyString());
 
         List<ChatEvent> events = collect(contextOf(true, "你好"));
 
@@ -294,7 +253,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("模型中途报错：发 error 事件，但出错前已生成的部分以 failed 落库")
     void keepsPartialReplyWhenModelFails() {
-        modelFailsAfter("半截", new RuntimeException("模型挂了"));
+        model.failsAfter("半截", new RuntimeException("模型挂了"));
 
         List<ChatEvent> events = collect(contextOf(false, "你好"));
 
@@ -309,7 +268,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("模型一个字都没返回：发 error 事件，不落库空消息")
     void emitsErrorWhenModelReturnsNothing() {
-        modelEmits();
+        model.emits();
 
         List<ChatEvent> events = collect(contextOf(false, "你好"));
 
@@ -322,7 +281,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("正常结束：回复以 completed 落库")
     void savesCompletedStatusOnNormalCompletion() {
-        modelEmits("好");
+        model.emits("好");
         assistantInsertReturns(48L);
 
         collect(contextOf(false, "你好"));
@@ -333,7 +292,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("落库后的助手消息会刷新会话活跃时间")
     void refreshesConversationActivityTime() {
-        modelEmits("好");
+        model.emits("好");
         assistantInsertReturns(47L);
 
         collect(contextOf(false, "你好"));
@@ -346,7 +305,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("重新生成：原地覆盖那条旧回复，既不删也不新插")
     void regenerateOverwritesExistingReply() {
-        modelEmits("新答案");
+        model.emits("新答案");
         when(messageMapper.updateReply(EXISTING_REPLY_ID, CONVERSATION_ID, "新答案",
                 Message.STATUS_COMPLETED)).thenReturn(1);
 
@@ -363,7 +322,7 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("重新生成中途报错：半截内容照样覆盖上去，状态是 failed")
     void regenerateMarksFailureOnExistingReply() {
-        modelFailsAfter("半截", new RuntimeException("模型挂了"));
+        model.failsAfter("半截", new RuntimeException("模型挂了"));
         when(messageMapper.updateReply(EXISTING_REPLY_ID, CONVERSATION_ID, "半截",
                 Message.STATUS_FAILED)).thenReturn(1);
 
@@ -377,42 +336,12 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("重新生成一个字都没产出：旧回复原样不动")
     void regenerateLeavesExistingReplyWhenNothingGenerated() {
-        modelEmits();
+        model.emits();
 
         collect(regenerateContextOf());
 
         verify(messageMapper, never()).updateReply(anyLong(), anyLong(), anyString(), anyString());
         verify(messageMapper, never()).insert(any(Message.class));
-    }
-
-    @Test
-    @DisplayName("重新生成的上下文：尾条助手回复的 id 被记下，且它不再作为历史发给模型")
-    void regenerateTargetsTrailingReply() {
-        when(currentUserProvider.userId()).thenReturn(USER_ID);
-        when(conversationService.requireOwned(CONVERSATION_ID)).thenReturn(conversation("已命名"));
-        when(messageMapper.selectList(any(Wrapper.class))).thenReturn(new ArrayList<>(List.of(
-                messageRow(7L, "user", "第二问"), messageRow(8L, "assistant", "要覆盖的答"))));
-        when(attachmentService.findByMessageId(7L)).thenReturn(List.of());
-
-        ChatContext context = service.prepareRegenerate(CONVERSATION_ID);
-
-        assertThat(context.existingReplyId()).isEqualTo(8L);
-        // 历史为空：那条提问是本轮提问、那条助手回复是本轮要覆盖的对象，两者都不该进上下文
-        assertThat(context.modelMessages()).hasSize(1);
-        assertThat(context.modelMessages().get(0)).isInstanceOf(SystemMessage.class);
-        verify(messageMapper, never()).deleteById(anyLong());
-    }
-
-    @Test
-    @DisplayName("重新生成时尾条不是助手回复：本轮没有可覆盖的行")
-    void regenerateWithoutTrailingReplyHasNothingToOverwrite() {
-        when(currentUserProvider.userId()).thenReturn(USER_ID);
-        when(conversationService.requireOwned(CONVERSATION_ID)).thenReturn(conversation("已命名"));
-        when(messageMapper.selectList(any(Wrapper.class)))
-                .thenReturn(new ArrayList<>(List.of(messageRow(7L, "user", "只问过"))));
-        when(attachmentService.findByMessageId(7L)).thenReturn(List.of());
-
-        assertThat(service.prepareRegenerate(CONVERSATION_ID).existingReplyId()).isNull();
     }
 
     // ---------------------------------------------------------------- 客户端断开
@@ -421,12 +350,13 @@ class ChatStreamServiceTests {
     @DisplayName("客户端断开：把断开那一刻已生成的部分以 interrupted 落库")
     void keepsPartialReplyWhenClientDisconnects() throws Exception {
         CountDownLatch modelCalled = new CountDownLatch(1);
-        AtomicReference<StreamingChatResponseHandler> handler = captureHandler(modelCalled);
+        AtomicReference<dev.langchain4j.model.chat.response.StreamingChatResponseHandler> handler =
+                model.handsOverHandler(modelCalled);
         CountDownLatch saved = new CountDownLatch(1);
         assistantInsertReturns(60L, saved);
 
         Disposable subscription = service.stream(contextOf(false, "你好")).subscribe();
-        // 先等到 chat 真的被调过：sink.onCancel 的注册排在它之前，注册完再取消才传得到那个回调
+        // 先等到 chat 真的被调过：取消回调要等订阅建立之后才挂得上
         assertThat(modelCalled.await(5, TimeUnit.SECONDS)).isTrue();
         handler.get().onPartialResponse("半截");
         subscription.dispose();
@@ -442,7 +372,8 @@ class ChatStreamServiceTests {
     @DisplayName("断开之后模型才走到完成：这一轮不会再被写第二遍")
     void doesNotWriteTwiceWhenModelCompletesAfterDisconnect() throws Exception {
         CountDownLatch modelCalled = new CountDownLatch(1);
-        AtomicReference<StreamingChatResponseHandler> handler = captureHandler(modelCalled);
+        AtomicReference<dev.langchain4j.model.chat.response.StreamingChatResponseHandler> handler =
+                model.handsOverHandler(modelCalled);
         CountDownLatch saved = new CountDownLatch(1);
         assistantInsertReturns(61L, saved);
 
@@ -453,10 +384,49 @@ class ChatStreamServiceTests {
         assertThat(saved.await(5, TimeUnit.SECONDS)).isTrue();
         // 真实适配器停不下来，断开之后仍可能走完成回调。这次晚到的调用必须被吞掉：
         // singleSavedReply() 断言全轮只 insert 过一次，重复写会让它失败
-        handler.get().onCompleteResponse(null);
+        handler.get().onCompleteResponse(dev.langchain4j.model.chat.response.ChatResponse.builder()
+                .aiMessage(AiMessage.from("半截"))
+                .build());
 
         assertThat(singleSavedReply().getStatus()).isEqualTo(Message.STATUS_INTERRUPTED);
         verify(messageMapper, never()).updateReply(anyLong(), anyLong(), anyString(), anyString());
+    }
+
+    // ---------------------------------------------------------------- 记忆
+
+    @Test
+    @DisplayName("记忆每轮重建：系统提示词在最前，接着是库里的历史，本轮提问在最后")
+    void seedsMemoryFromTheDatabaseOnEveryTurn() {
+        prepareSucceeds(9L, List.of(messageRow(5L, "user", "上一问"), messageRow(6L, "assistant", "上一答")));
+        model.emits("好");
+
+        collect(service.prepare(CONVERSATION_ID, "这一问", List.of()));
+
+        List<ChatMessage> sent = sentMessages();
+        assertThat(sent).containsExactly(
+                SystemMessage.from(Prompt.SYSTEM_PROMPT),
+                UserMessage.from("上一问"),
+                AiMessage.from("上一答"),
+                UserMessage.from("这一问"));
+    }
+
+    @Test
+    @DisplayName("重新生成时，历史只到那条提问之前，提问本身作为本轮提问再发一次")
+    void regenerateRebuildsMemoryWithoutTheTrailingReply() {
+        when(currentUserProvider.userId()).thenReturn(USER_ID);
+        when(conversationService.requireOwned(CONVERSATION_ID)).thenReturn(conversation("已命名"));
+        when(messageMapper.selectList(any(Wrapper.class))).thenReturn(new ArrayList<>(List.of(
+                messageRow(7L, "user", "第二问"), messageRow(8L, "assistant", "要覆盖的答"))));
+        when(attachmentService.findByMessageId(7L)).thenReturn(List.of());
+        model.emits("新答案");
+        when(messageMapper.updateReply(8L, CONVERSATION_ID, "新答案", Message.STATUS_COMPLETED))
+                .thenReturn(1);
+
+        collect(service.prepareRegenerate(CONVERSATION_ID));
+
+        assertThat(sentMessages()).containsExactly(
+                SystemMessage.from(Prompt.SYSTEM_PROMPT),
+                UserMessage.from("第二问"));
     }
 
     // ---------------------------------------------------------------- 附件与多模态
@@ -507,7 +477,7 @@ class ChatStreamServiceTests {
         Attachment image = attachment(100L, "image/png", 3);
         when(attachmentService.findByMessageId(9L)).thenReturn(List.of(image));
         when(attachmentService.readContent(image)).thenReturn(new byte[]{1, 2, 3});
-        modelEmits("好");
+        model.emits("好");
 
         ChatContext context = service.prepare(CONVERSATION_ID, "这是什么", List.of(100L));
         assertThat(collect(context)).contains(new ChatEvent.Done(ASSISTANT_MESSAGE_ID));
@@ -527,7 +497,7 @@ class ChatStreamServiceTests {
         Attachment video = attachment(101L, "video/mp4", 3);
         when(attachmentService.findByMessageId(9L)).thenReturn(List.of(video));
         when(attachmentService.readContent(video)).thenReturn(new byte[]{1});
-        modelEmits("好");
+        model.emits("好");
 
         ChatContext context = service.prepare(CONVERSATION_ID, "   ", List.of(101L));
         collect(context);
@@ -546,7 +516,7 @@ class ChatStreamServiceTests {
         prepareSucceeds(9L, List.of());
         Attachment document = attachment(104L, "text/plain", 3);
         when(attachmentService.findByMessageId(9L)).thenReturn(List.of(document));
-        modelEmits("好");
+        model.emits("好");
 
         ChatContext context = service.prepare(CONVERSATION_ID, "   ", List.of(104L));
         collect(context);
@@ -565,7 +535,7 @@ class ChatStreamServiceTests {
         prepareSucceeds(9L, List.of());
         Attachment document = attachment(105L, "text/plain", 3);
         when(attachmentService.findByMessageId(9L)).thenReturn(List.of(document));
-        modelEmits("好");
+        model.emits("好");
 
         collect(service.prepare(CONVERSATION_ID, "总结一下", List.of(105L)));
 
@@ -606,13 +576,29 @@ class ChatStreamServiceTests {
         when(attachmentService.findByMessageId(9L)).thenReturn(List.of(broken));
         when(attachmentService.readContent(broken))
                 .thenThrow(new com.webchat.storage.AttachmentStorageException("丢了", null));
-        modelEmits("好");
+        model.emits("好");
 
         collect(service.prepare(CONVERSATION_ID, "还在吗", List.of(102L)));
 
         UserMessage sent = lastUserMessageOf(sentMessages());
         assertThat(sent.contents()).hasSize(1);
         assertThat(sent.contents().get(0)).isEqualTo(TextContent.from("还在吗"));
+    }
+
+    @Test
+    @DisplayName("一条附件都读不出来：prepare 直接 400，不会留下一条空消息")
+    void rejectsQuestionWhoseAttachmentsAreAllUnreadable() {
+        prepareSucceeds(9L, List.of());
+        Attachment broken = attachment(106L, "image/png", 3);
+        when(attachmentService.findByMessageId(9L)).thenReturn(List.of(broken));
+        when(attachmentService.readContent(broken))
+                .thenThrow(new com.webchat.storage.AttachmentStorageException("丢了", null));
+
+        // 「空的 contents 会让 UserMessage 抛 IllegalArgumentException 变成 500」——
+        // 这道守卫把它挪到了 prepare 里，用户拿到的是干净的 400，事务也会把用户消息回滚掉
+        assertThatThrownBy(() -> service.prepare(CONVERSATION_ID, "   ", List.of(106L)))
+                .isInstanceOf(BizException.class)
+                .hasMessageContaining("附件内容已不可用");
     }
 
     @Test
@@ -629,7 +615,7 @@ class ChatStreamServiceTests {
         Attachment image = attachment(103L, "image/jpeg", 3);
         when(attachmentService.findByMessageId(5L)).thenReturn(List.of(image));
         when(attachmentService.readContent(image)).thenReturn(new byte[]{9});
-        modelEmits("好");
+        model.emits("好");
 
         collect(service.prepareRegenerate(CONVERSATION_ID));
 
@@ -643,12 +629,13 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("检索到的片段作为本轮提问的第一段文本注入，system 提示词保持常量")
     void injectsRetrievedKnowledgeIntoTheQuestion() {
-        modelEmits("好");
+        seedSystemPrompt();
+        model.emits("好");
         when(documentIndexService.knowledgeFor("它讲了什么", List.of(104L)))
                 .thenReturn("【片段 1｜来源：纪要.txt】\n季度目标");
 
-        collect(new ChatContext(1L, 7L, MODEL_MESSAGES, userMessage("它讲了什么"), List.of(),
-                "它讲了什么", List.of(104L), false, "它讲了什么", null));
+        collect(new ChatContext(1L, 7L, List.of(TextContent.from("它讲了什么")), "它讲了什么",
+                List.of(104L), false, "它讲了什么", null));
 
         List<ChatMessage> messages = sentMessages();
         // 资料跟着问题走，不动 system 提示词——合并进 system 会破坏 DashScope 的前缀缓存，
@@ -663,11 +650,28 @@ class ChatStreamServiceTests {
     }
 
     @Test
+    @DisplayName("资料与媒体同处一条消息：资料在最前，媒体照旧")
+    void keepsMediaNextToTheInjectedKnowledge() {
+        seedSystemPrompt();
+        model.emits("好");
+        when(documentIndexService.knowledgeFor("它讲了什么", List.of(104L))).thenReturn("资料");
+
+        collect(new ChatContext(1L, 7L,
+                List.of(TextContent.from("它讲了什么"), ImageContent.from("AQID", "image/png")),
+                "它讲了什么", List.of(104L), false, "它讲了什么", null));
+
+        assertThat(lastUserMessageOf(sentMessages()).contents()).containsExactly(
+                TextContent.from("资料"),
+                TextContent.from("它讲了什么"),
+                ImageContent.from("AQID", "image/png"));
+    }
+
+    @Test
     @DisplayName("检索范围取自会话内的文本附件，随 prepare 一并确定")
     void passesConversationDocumentsAsRetrievalScope() {
         prepareSucceeds(9L, List.of());
         when(attachmentService.listTextAttachmentIds(CONVERSATION_ID)).thenReturn(List.of(100L, 101L));
-        modelEmits("好");
+        model.emits("好");
 
         collect(service.prepare(CONVERSATION_ID, "总结一下", List.of()));
 
@@ -677,13 +681,13 @@ class ChatStreamServiceTests {
     @Test
     @DisplayName("检索失败不能把一次对话变成失败：降级成「没有资料」继续")
     void keepsAnsweringWhenRetrievalFails() {
-        modelEmits("好");
+        model.emits("好");
         assistantInsertReturns(51L);
         when(documentIndexService.knowledgeFor(any(), any()))
                 .thenThrow(new RuntimeException("embedding 服务不可用"));
 
-        List<ChatEvent> events = collect(new ChatContext(1L, 7L, MODEL_MESSAGES, userMessage("你好"),
-                List.of(), "你好", List.of(100L), false, "你好", null));
+        List<ChatEvent> events = collect(new ChatContext(1L, 7L, List.of(TextContent.from("你好")),
+                "你好", List.of(100L), false, "你好", null));
 
         assertThat(events).containsExactly(new ChatEvent.Delta("好"), new ChatEvent.Done(51L));
         assertThat(events).noneMatch(ChatEvent.Failed.class::isInstance);
@@ -709,15 +713,33 @@ class ChatStreamServiceTests {
         Attachment historyDocument = attachment(301L, "text/plain", 1, 5L);
         when(attachmentService.findByMessageIds(List.of(5L)))
                 .thenReturn(List.of(historyImage, historyDocument));
-        modelEmits("好");
+        model.emits("好");
 
         collect(service.prepare(CONVERSATION_ID, "都看看吧", List.of()));
 
+        // 请求 = 系统提示词 + 历史 + 本轮提问，历史那条在第 2 位
         UserMessage historySent = (UserMessage) sentMessages().get(1);
         assertThat(historySent.contents())
                 .as("媒体超预算被裁掉，文本附件的说明必须留下")
                 .noneMatch(ImageContent.class::isInstance)
                 .anyMatch(content -> content instanceof TextContent text
                         && text.text().contains("附件-301"));
+    }
+
+    @Test
+    @DisplayName("历史里的媒体在预算内时照常带上：最新那批优先")
+    void keepsHistoryMediaWithinBudget() {
+        Message historyUser = userMessage("上一轮");
+        historyUser.setId(5L);
+        prepareSucceeds(9L, List.of(historyUser));
+        Attachment historyImage = attachment(300L, "image/png", 1, 5L);
+        when(attachmentService.findByMessageIds(List.of(5L))).thenReturn(List.of(historyImage));
+        when(attachmentService.readContent(historyImage)).thenReturn(new byte[]{7});
+        model.emits("好");
+
+        collect(service.prepare(CONVERSATION_ID, "接着看", List.of()));
+
+        UserMessage historySent = (UserMessage) sentMessages().get(1);
+        assertThat(historySent.contents()).anyMatch(ImageContent.class::isInstance);
     }
 }

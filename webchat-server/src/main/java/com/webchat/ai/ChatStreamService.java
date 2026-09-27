@@ -5,7 +5,6 @@ import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.ai.rag.RagProperties;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
-import com.webchat.config.AttachmentProperties;
 import com.webchat.config.CurrentUserProvider;
 import com.webchat.entity.Attachment;
 import com.webchat.entity.Conversation;
@@ -14,45 +13,33 @@ import com.webchat.mapper.ConversationMapper;
 import com.webchat.mapper.MessageMapper;
 import com.webchat.service.AttachmentService;
 import com.webchat.service.ConversationService;
-import com.webchat.storage.AttachmentStorageException;
-import dev.langchain4j.data.message.AiMessage;
-import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.Content;
-import dev.langchain4j.data.message.ImageContent;
-import dev.langchain4j.data.message.SystemMessage;
-import dev.langchain4j.data.message.TextContent;
-import dev.langchain4j.data.message.UserMessage;
-import dev.langchain4j.data.message.VideoContent;
-import dev.langchain4j.model.chat.StreamingChatModel;
-import dev.langchain4j.model.chat.request.ChatRequest;
-import dev.langchain4j.model.chat.response.ChatResponse;
-import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.ArrayList;
-import java.util.Base64;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.stream.Collectors;
 
 /**
  * 流式对话的编排：合并「落库」与「生成」两条线。
  *
  * <p>整体分三段，段与段的边界决定了错误处理方式：
  * <ol>
- *   <li>同步前置（{@link #prepare}）——还在响应提交之前，失败走普通 JSON 错误响应</li>
- *   <li>文档检索 + 流式生成（{@link #stream}）——失败只能走 SSE 的 error 事件</li>
+ *   <li>同步前置（{@link #prepare}）——校验、落用户消息、灌记忆、组装本轮提问；
+ *       此时的失败还在响应提交之前，可以走普通 JSON 错误响应</li>
+ *   <li>流式生成（{@link #stream}）——调 {@link ChatAssistant}，检索与记忆由框架接管；
+ *       开始写出之后的失败只能走 SSE 的 error 事件</li>
  *   <li>标题生成——排在 done 之后，失败必须静默吞掉</li>
  * </ol>
+ *
+ * <p>模型侧的三件事（系统提示词、记忆、检索）都不在本类里：本类只负责「库里怎么记」与
+ * 「这一轮怎么收场」，装配见 {@link AssistantConfig}，检索见
+ * {@link com.webchat.ai.rag.DocumentIndexService}。
  */
 @Slf4j
 @Service
@@ -61,25 +48,21 @@ public class ChatStreamService {
 
     private static final String ROLE_USER = "user";
     private static final String ROLE_ASSISTANT = "assistant";
-    private static final String ROLE_SYSTEM = "system";
 
-    /** 白名单保证 mime_type 必然以它、{@code video/} 或 {@code text/} 开头，据此分派 */
-    private static final String IMAGE_PREFIX = "image/";
-    private static final String TEXT_PREFIX = "text/";
-
-    private final StreamingChatModel streamingChatModel;
+    private final ChatAssistant chatAssistant;
+    private final ConversationMemoryStore memoryStore;
+    private final ChatMessageAssembler messageAssembler;
     private final ConversationMapper conversationMapper;
     private final MessageMapper messageMapper;
     private final ConversationService conversationService;
     private final AttachmentService attachmentService;
-    private final AttachmentProperties attachmentProperties;
     private final CurrentUserProvider currentUserProvider;
     private final TitleGenerator titleGenerator;
     private final DocumentIndexService documentIndexService;
     private final RagProperties ragProperties;
 
     /**
-     * 发送消息的同步前置：校验参数、落用户消息、绑定附件、组装模型输入。
+     * 发送消息的同步前置：校验参数、落用户消息、绑定附件、灌记忆、组装本轮提问。
      *
      * <p>用户消息在这里就落库，好处是生成失败只丢回复、不丢提问，同时给「重新生成」留下可寻的尾部用户消息。
      * 附件绑定也在同一个事务里——任何一条附件不可用都会把用户消息一起回滚，
@@ -149,21 +132,25 @@ public class ChatStreamService {
         }
 
         Message lastUserMessage = messages.get(messages.size() - 1);
-        List<Message> history = messages.subList(0, messages.size() - 1);
         // 附件轮的提问正文可能是空串，必须把它当初的附件一并取回来——否则重新生成等于发了个空提问，
         // 答案与首次必然不同，而用户以为在重跑同一问
         List<Attachment> attachments = attachmentService.findByMessageId(lastUserMessage.getId());
-        return buildContext(conversation, userId, history, lastUserMessage, attachments, existingReplyId);
+        // 历史只到这条提问之前：这条提问自己要被当成「本轮提问」再发一次，
+        // 留在记忆里就成了同一句话的两次出现
+        return buildContext(conversation, userId, messages.subList(0, messages.size() - 1),
+                lastUserMessage, attachments, existingReplyId);
     }
 
     /**
      * 把一次生成过程表示成事件流。
      *
-     * <p>先做文档检索再出流：检索要调一次 embedding，结果要作为本轮提问的第一段文本注入，
-     * 所以它必须排在组装请求之前。检索跑在弹性线程池上（不占 Tomcat 请求线程），
+     * <p>先做文档检索再出流：检索要调一次 embedding，结果要作为本轮提问的第一段文本，
+     * 所以它必须排在调用模型之前。检索跑在弹性线程池上（不占 Tomcat 请求线程），
      * 并且<b>失败一律降级成「没检索到」</b>——资料取不到不该把一次对话变成失败。
      *
      * <p>注意本方法<b>不开事务</b>：整段生成期间持有数据库连接会很快耗尽连接池。
+     *
+     * <p>事件顺序是「若干 delta → done →（仅新会话）title」，失败则以 error 结束。
      */
     public Flux<ChatEvent> stream(ChatContext context) {
         Flux<ChatEvent> reply = Mono.fromCallable(() -> documentIndexService.knowledgeFor(
@@ -183,101 +170,75 @@ public class ChatStreamService {
         return reply.concatWith(titleFlux(context));
     }
 
+    /**
+     * 一次生成：把模型吐出的增量变成 delta 事件，并在收尾时落库。
+     *
+     * <p>三种收场都要落库，靠 {@link ReplyState} 这个「谁写」的仲裁者区分：正常结束由完成回调写、
+     * 报错由失败分支写、客户端断开由取消回调写。几个算子各自的职责见方法内注释。
+     */
     private Flux<ChatEvent> replyFlux(ChatContext context, String knowledge) {
-        List<ChatMessage> messages = assembleMessages(context, knowledge);
-        return Flux.<ChatEvent>create(sink -> {
-                    ReplyState state = new ReplyState();
-                    sink.onCancel(() -> {
-                        // 客户端断开：用户点「停止生成」、切会话、关页面，服务端看到的都是这一条路。
-                        // 把断开那一刻已经生成的部分落库——用户看过这段内容，刷新后它不该凭空消失。
-                        // 快照可能比用户看到的略多（BUFFER 里还压着没发出去的增量），方向上无害
-                        String snapshot = state.cancelAndSnapshot();
-                        if (snapshot != null && !snapshot.isEmpty()) {
-                            saveReply(context, snapshot, Message.STATUS_INTERRUPTED);
-                        }
-                    });
-                    requestModel(context, messages, sink, state);
-                }, FluxSink.OverflowStrategy.BUFFER)
-                // 让模型调用与随后的落库都离开 Tomcat 请求线程
+        List<Content> question = ChatMessageAssembler.withKnowledge(context.currentContents(), knowledge);
+        ReplyState state = new ReplyState();
+        // defer 是必要的：真正的调用发生在订阅时，也就是下面 subscribeOn 切过去的弹性线程上，
+        // 而不是控制器的 Tomcat 线程上
+        return Flux.defer(() -> chatAssistant.chat(context.conversationId(), question))
+                // 只累计、不下发：断开之后模型可能还会吐几个增量，累计到快照里没有意义，
+                // 而「发不发得出去」由下游是否已取消决定
+                .doOnNext(state::append)
+                .<ChatEvent>map(ChatEvent.Delta::new)
+                // 正常结束：取走正文并落库，发 done（或「模型没返回任何内容」）
+                .concatWith(Flux.defer(() -> completionEvents(context, state)))
+                // 生成中途报错：把出错前已生成的部分落库为 failed，再以 error 事件收场。
+                // 吞掉异常而不是继续向外抛：响应提交之后再抛会重新进入 Spring 的异常解析器，
+                // 可能把 JSON 错误体追加进已经开始输出的 SSE 流
+                .onErrorResume(error -> failureEvents(context, state, error))
+                // 客户端断开：用户点「停止生成」、切会话、关页面，服务端看到的都是这一条路。
+                // 把断开那一刻已经生成的部分落库——用户看过这段内容，刷新后它不该凭空消失
+                .doOnCancel(() -> saveInterrupted(context, state))
+                // 让模型调用、检索与随后的落库都离开 Tomcat 请求线程
                 .subscribeOn(Schedulers.boundedElastic());
     }
 
-    /** 把系统提示词、历史、检索到的资料与本轮提问拼成最终发给模型的消息列表 */
-    private List<ChatMessage> assembleMessages(ChatContext context, String knowledge) {
-        List<ChatMessage> messages = new ArrayList<>(context.modelMessages());
-        messages.add(toUserMessage(context.currentMessage(), context.currentAttachments(), knowledge));
-        return List.copyOf(messages);
-    }
-
-    private void requestModel(ChatContext context, List<ChatMessage> messages,
-                              FluxSink<ChatEvent> sink, ReplyState state) {
-        try {
-            streamingChatModel.chat(
-                    ChatRequest.builder().messages(messages).build(),
-                    new StreamingChatResponseHandler() {
-
-                        @Override
-                        public void onPartialResponse(String token) {
-                            // append 在客户端已断开时返回 false。sink.next 刻意留在它外面：
-                            // BUFFER 策略下这一句可能同步阻塞在往半死的连接写字节上
-                            if (state.append(token)) {
-                                sink.next(new ChatEvent.Delta(token));
-                            }
-                        }
-
-                        @Override
-                        public void onCompleteResponse(ChatResponse response) {
-                            String text = state.claim();
-                            if (text == null) {
-                                // 写入权已被取消路径取走：这一轮的内容早就不归这里管了
-                                sink.complete();
-                                return;
-                            }
-                            if (text.isEmpty()) {
-                                sink.next(new ChatEvent.Failed("模型没有返回任何内容"));
-                                sink.complete();
-                                return;
-                            }
-                            Long messageId = saveReply(context, text, Message.STATUS_COMPLETED);
-                            sink.next(messageId == null
-                                    ? new ChatEvent.Failed("回复保存失败")
-                                    : new ChatEvent.Done(messageId));
-                            sink.complete();
-                        }
-
-                        @Override
-                        public void onError(Throwable error) {
-                            log.error("流式生成失败，conversationId={}", context.conversationId(), error);
-                            failWith(context, sink, state, briefReason(error));
-                        }
-                    });
-        } catch (Exception e) {
-            // chat(...) 自己抛异常。适配器也可能先推了几个增量再抛，所以这段同样要走落库
-            log.error("调用模型失败，conversationId={}", context.conversationId(), e);
-            failWith(context, sink, state, briefReason(e));
+    /** 正常结束：落 completed，发 done；一个字都没生成时不落库，只发一条 error */
+    private Flux<ChatEvent> completionEvents(ChatContext context, ReplyState state) {
+        String text = state.claim();
+        if (text == null) {
+            // 写入权已被取消路径取走：这一轮的内容早就不归这里管了
+            return Flux.empty();
         }
+        if (text.isEmpty()) {
+            return Flux.just(new ChatEvent.Failed("模型没有返回任何内容"));
+        }
+        Long messageId = saveReply(context, text, Message.STATUS_COMPLETED);
+        return Flux.just(messageId == null
+                ? new ChatEvent.Failed("回复保存失败")
+                : new ChatEvent.Done(messageId));
     }
 
     /**
-     * 以 error 事件收场，并把出错前已生成的部分落库为 {@code failed}。
+     * 生成中途报错：把出错前已生成的部分落库为 {@code failed}，再以 error 事件收场。
      *
      * <p>一个字都没生成时什么都不写：空消息既没有展示价值，作为历史发给模型也会出问题。
      */
-    private void failWith(ChatContext context, FluxSink<ChatEvent> sink,
-                          ReplyState state, String reason) {
+    private Flux<ChatEvent> failureEvents(ChatContext context, ReplyState state, Throwable error) {
+        log.error("流式生成失败，conversationId={}", context.conversationId(), error);
         String text = state.claim();
         if (text == null) {
             // 客户端已经断开，取消路径先把这一轮写走了
-            sink.complete();
-            return;
+            return Flux.empty();
         }
         if (!text.isEmpty()) {
             saveReply(context, text, Message.STATUS_FAILED);
         }
-        sink.next(new ChatEvent.Failed(reason));
-        // complete 而不是 error：响应提交之后再调 sink.error 会重新进入 Spring 的异常解析器，
-        // 可能把 JSON 错误体追加进已经开始输出的 SSE 流
-        sink.complete();
+        return Flux.just(new ChatEvent.Failed(briefReason(error)));
+    }
+
+    /** 客户端断开：把断开那一刻的快照落库为 {@code interrupted}，一个字都没有时什么都不写 */
+    private void saveInterrupted(ChatContext context, ReplyState state) {
+        String snapshot = state.cancelAndSnapshot();
+        if (snapshot != null && !snapshot.isEmpty()) {
+            saveReply(context, snapshot, Message.STATUS_INTERRUPTED);
+        }
     }
 
     /**
@@ -321,9 +282,8 @@ public class ChatStreamService {
     /**
      * 一轮生成的共享状态：累计正文、是否已被取消、这次写入归谁。
      *
-     * <p>三个回调与取消信号可能来自不同线程（模型推送线程、容器察觉断开的线程、弹性池），
-     * 所以全部改动都收在这一个监视器里。刻意不把 {@code sink.next} 收进来——见
-     * {@code onPartialResponse} 的说明。
+     * <p>取消信号与生成回调可能来自不同线程（模型推送线程、容器察觉断开的线程），
+     * 所以全部改动都收在这一个监视器里。
      *
      * <p>「谁写」由返回值决定：{@link #cancelAndSnapshot} 与 {@link #claim} 互斥，
      * 只有一个能拿到非 null，所以半截内容与完整内容不会被写两次，也不需要额外的标记。
@@ -334,13 +294,11 @@ public class ChatStreamService {
         private boolean cancelled;
         private boolean claimed;
 
-        /** 追加一段增量；已被取消时返回 false，调用方据此跳过下发 */
-        synchronized boolean append(String token) {
-            if (cancelled) {
-                return false;
+        /** 追加一段增量；已被取消就丢掉——断开之后的增量不属于用户看到过的那段内容 */
+        synchronized void append(String token) {
+            if (!cancelled) {
+                accumulated.append(token);
             }
-            accumulated.append(token);
-            return true;
         }
 
         /** 客户端断开：置位并取走「断开那一刻」的快照；返回 null 表示这次写入已经不归取消路径 */
@@ -370,13 +328,16 @@ public class ChatStreamService {
      * 所以「若干 delta → done → title」的顺序由结构保证，不需要额外同步。
      */
     private Flux<ChatEvent> titleFlux(ChatContext context) {
-        return Mono.fromCallable(() -> titleGenerator.generate(context.titleSource()).orElse(null))
-                // 标题走的是阻塞式 ChatModel.chat(...)，必须换到弹性线程池
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMapMany(title -> {
+        return Flux.defer(() -> {
+                    String title = titleGenerator.generate(context.titleSource()).orElse(null);
+                    if (title == null) {
+                        return Flux.<ChatEvent>empty();
+                    }
                     conversationMapper.updateTitle(context.conversationId(), context.userId(), title);
                     return Flux.<ChatEvent>just(new ChatEvent.Title(title));
                 })
+                // 标题走的是阻塞式 ChatModel.chat(...)，必须换到弹性线程池
+                .subscribeOn(Schedulers.boundedElastic())
                 // 标题失败必须吞掉：此时助手消息已经落库，若让异常冒泡就会发出 error 事件，
                 // 把一次成功且已持久化的回复变成「失败」
                 .onErrorResume(e -> {
@@ -385,185 +346,38 @@ public class ChatStreamService {
                 });
     }
 
+    /**
+     * 组装本轮上下文，并把系统提示词与历史灌进该会话的记忆槽位。
+     *
+     * <p><b>记忆每轮重建</b>，而不是首轮灌一次、之后增量维护：库是唯一真源，这样中断／失败落库的半截回复、
+     * 重启、切会话、重新生成都不会让「模型看到的」与「库里记着的」分叉；历史附件的媒体预算也才谈得上
+     * 每轮重算（见 {@link ChatMessageAssembler}）。灌进去的那一批里，最后一条必然是助手回复或用户消息，
+     * 本轮提问随后由框架追加在它之后。
+     *
+     * @param history 本轮之前的历史；不含本轮提问，重生成时也不含那条要被覆盖的旧回复
+     */
     private ChatContext buildContext(Conversation conversation, long userId, List<Message> history,
                                      Message userMessage, List<Attachment> userAttachments,
                                      Long existingReplyId) {
-        List<Message> recentHistory = trimToRecent(history);
-        Map<Long, List<Attachment>> historyMedia = pickHistoryMedia(recentHistory, userAttachments);
-
-        List<ChatMessage> modelMessages = new ArrayList<>();
-        modelMessages.add(SystemMessage.from(Prompt.SYSTEM_PROMPT));
-        for (Message message : recentHistory) {
-            modelMessages.add(toChatMessage(message, historyMedia.getOrDefault(message.getId(), List.of())));
-        }
+        memoryStore.seed(conversation.getId(),
+                messageAssembler.renderMemory(history, userAttachments));
 
         // 标题只在「标题仍是默认值」且「这条是该会话第一条用户消息」时生成。
-        // 前半句让「重新生成」不会给已有标题的会话改名，后半句又让它能补上首次生成失败而没写成的标题。
+        // 前半句让「重新生成」不会给已有标题的会话改名，后半句又让它能补上首次生成失败而没写成的标题
         boolean titleNeeded = ConversationService.DEFAULT_TITLE.equals(conversation.getTitle())
                 && history.stream().noneMatch(message -> ROLE_USER.equals(message.getRole()));
 
+        List<Content> question = messageAssembler.renderQuestion(userMessage, userAttachments);
         return new ChatContext(
                 conversation.getId(),
                 userId,
-                List.copyOf(modelMessages),
-                userMessage,
-                List.copyOf(userAttachments),
+                question,
                 retrievalQueryOf(userMessage),
                 // 检索范围＝本会话内的全部文本附件，含本轮这条（刚绑定，已经带上 conversation_id）
                 attachmentService.listTextAttachmentIds(conversation.getId()),
                 titleNeeded,
                 titleSourceOf(userMessage, userAttachments),
                 existingReplyId);
-    }
-
-    /**
-     * 挑出历史里还要发给模型的附件。
-     *
-     * <p><b>媒体</b>（图片／视频）受预算约束：整轮请求的数量不超过单条消息的上限、字节数不超过配置的
-     * 上限，本轮提问的附件优先占额度，剩下的从最近的历史消息往前补——最新那批正是用户刚发上去、
-     * 语义上也最相关的，更早的只发文本。没有这道闸，20 条历史 × 5 个文件会把请求撑爆。
-     *
-     * <p><b>文本附件不受预算约束、也不占额度</b>：它的内容不进请求体（走检索），带上它只是为了在历史
-     * 那条消息里渲染出一行「用户上传了文件：x.txt」。这一行不能省——那条消息的正文可能是空串
-     * （只传文件没打字），少了它就成了一条内容为空的用户消息。
-     */
-    private Map<Long, List<Attachment>> pickHistoryMedia(List<Message> recentHistory,
-                                                         List<Attachment> currentAttachments) {
-        if (recentHistory.isEmpty()) {
-            return Map.of();
-        }
-        List<Attachment> currentMedia = currentAttachments.stream().filter(a -> !isDocument(a)).toList();
-        long remainingCount = attachmentProperties.maxFilesPerMessage() - currentMedia.size();
-        long remainingBytes = attachmentProperties.maxRequestMediaSize().toBytes() - totalBytes(currentMedia);
-
-        List<Long> historyIds = recentHistory.stream().map(Message::getId).toList();
-        Map<Long, List<Attachment>> byMessage = attachmentService.findByMessageIds(historyIds).stream()
-                .collect(Collectors.groupingBy(Attachment::getMessageId,
-                        LinkedHashMap::new, Collectors.toList()));
-
-        Map<Long, List<Attachment>> picked = new LinkedHashMap<>();
-        long count = 0;
-        long bytes = 0;
-        // 从最新的一条往前取
-        for (int index = recentHistory.size() - 1; index >= 0; index--) {
-            Message message = recentHistory.get(index);
-            if (!ROLE_USER.equals(message.getRole())) {
-                continue;
-            }
-            for (Attachment attachment : byMessage.getOrDefault(message.getId(), List.of())) {
-                if (isDocument(attachment)) {
-                    picked.computeIfAbsent(message.getId(), key -> new ArrayList<>()).add(attachment);
-                    continue;
-                }
-                if (count >= remainingCount || bytes + sizeOf(attachment) > remainingBytes) {
-                    // 媒体额度用完就不再带更早的媒体，但循环要继续——后面的文本附件还得收进来说明文件
-                    continue;
-                }
-                picked.computeIfAbsent(message.getId(), key -> new ArrayList<>()).add(attachment);
-                count++;
-                bytes += sizeOf(attachment);
-            }
-        }
-        return picked;
-    }
-
-    private ChatMessage toChatMessage(Message message, List<Attachment> attachments) {
-        return switch (message.getRole()) {
-            // 历史轮次不注入资料：检索结果只对本轮提问有意义，混进历史反而会重复占篇幅
-            case ROLE_USER -> toUserMessage(message, attachments, "");
-            case ROLE_ASSISTANT -> AiMessage.from(message.getContent());
-            case ROLE_SYSTEM -> SystemMessage.from(message.getContent());
-            default -> throw new IllegalStateException("未知的消息角色：" + message.getRole());
-        };
-    }
-
-    /**
-     * 组装用户消息。
-     *
-     * <p>内容的顺序是：检索到的资料 → 用户正文 → 文本附件说明 → 媒体。资料放在最前是因为它服务于
-     * 紧随其后的那个问题；它<b>不能单独作为一条 system 消息</b>——DashScope 的适配在清洗消息时，
-     * 遇到「system 之后不是 user」会把那条消息静默丢掉，不报错也不抛异常，RAG 会彻底失效却查不出
-     * 原因（见 {@link Prompt#KNOWLEDGE_PROMPT_TEMPLATE}）。
-     *
-     * @param knowledge 检索到的片段正文，没有资料时为空串
-     */
-    private UserMessage toUserMessage(Message message, List<Attachment> attachments, String knowledge) {
-        String text = message.getContent();
-        boolean hasKnowledge = knowledge != null && !knowledge.isBlank();
-        // 既没有附件也没有资料时走最朴素的路径，请求体与加 RAG 之前完全一致
-        if (attachments.isEmpty() && !hasKnowledge) {
-            return UserMessage.from(text == null ? "" : text);
-        }
-
-        List<Content> contents = new ArrayList<>();
-        if (hasKnowledge) {
-            contents.add(TextContent.from(knowledge));
-        }
-        if (text != null && !text.isBlank()) {
-            contents.add(TextContent.from(text));
-        }
-        // 文本附件本身不作为多模态内容发出去（内容走检索），但必须留下一行说明它是哪个文件，
-        // 否则「只带附件、没有文字」的那一轮会得到一份空的 contents，触发下面那道守卫——
-        // 用户收到的是「附件内容已不可用，请重新上传」，而文件其实好好的
-        List<Attachment> documents = attachments.stream().filter(ChatStreamService::isDocument).toList();
-        if (!documents.isEmpty()) {
-            contents.add(TextContent.from(documentNote(documents)));
-        }
-        attachments.stream()
-                .filter(attachment -> !isDocument(attachment))
-                .map(this::toMediaContent)
-                .flatMap(Optional::stream)
-                .forEach(contents::add);
-
-        if (contents.isEmpty()) {
-            // 有附件却一个都没读出来（对象已被清理之类）。UserMessage 由构造器强制 contents 非空，
-            // 与其让 LangChain4j 抛 IllegalArgumentException 变成 500，不如在这里说清楚
-            throw new BizException(ResultCode.BAD_REQUEST, "附件内容已不可用，请重新上传");
-        }
-        return UserMessage.builder().contents(contents).build();
-    }
-
-    /**
-     * 组装媒体内容。带附件时走多模态：文字与媒体各自是一个 content，媒体一律用 base64。
-     *
-     * <p>用 base64 而不是 URL，是因为开发环境的后端跑在内网（192.168.150.101），
-     * 模型侧根本拉不到那个地址；LangChain4j 的 DashScope 适配会把 base64 拼成
-     * {@code data:<mime>;base64,<数据>} 再发出去。
-     *
-     * <p>这里不需要显式打开什么「多模态开关」——DashScope 那个模型适配是按模型名判断的，
-     * {@code qwen3.8-max} 的版本号已经让它默认走多模态分支。
-     *
-     * <p>调用方保证传进来的都是媒体：白名单里的文本类型在 {@link #isDocument} 那里就被拦下了，
-     * 不拦的话它会被当成视频塞进 {@code VideoContent}。
-     */
-    private Optional<Content> toMediaContent(Attachment attachment) {
-        try {
-            String base64 = Base64.getEncoder().encodeToString(attachmentService.readContent(attachment));
-            String mimeType = attachment.getMimeType();
-            // 走到这里的只剩图片与视频两类，顶层类型就是这一处要的分派依据。
-            // 工厂方法两个参数的顺序都是 (base64Data, mimeType)，且 mimeType 不能为空——
-            // DashScope 适配据此拼成 data:<mime>;base64,<数据>
-            return Optional.of(mimeType.startsWith(IMAGE_PREFIX)
-                    ? ImageContent.from(base64, mimeType)
-                    : VideoContent.from(base64, mimeType));
-        } catch (AttachmentStorageException e) {
-            // 历史附件读不出来就跳过这一段，不值得让整轮对话失败
-            log.warn("附件内容读取失败，本轮跳过：id={}, objectKey={}",
-                    attachment.getId(), attachment.getObjectKey(), e);
-            return Optional.empty();
-        }
-    }
-
-    /** 该附件是否走检索（文本），而不是作为媒体塞进请求体 */
-    private static boolean isDocument(Attachment attachment) {
-        String mimeType = attachment.getMimeType();
-        return mimeType != null && mimeType.startsWith(TEXT_PREFIX);
-    }
-
-    private static String documentNote(List<Attachment> documents) {
-        return documents.stream()
-                .map(document -> "（用户上传了文件：" + document.getOriginalName() + "）")
-                .collect(Collectors.joining());
     }
 
     /** 用于检索的提问文本；只带附件没打字时为空串，此时检索会被跳过 */
@@ -587,23 +401,6 @@ public class ChatStreamService {
         return messageMapper.selectList(Wrappers.<Message>lambdaQuery()
                 .eq(Message::getConversationId, conversationId)
                 .orderByAsc(Message::getId));
-    }
-
-    private static List<Message> trimToRecent(List<Message> history) {
-        int size = history.size();
-        if (size <= Prompt.MAX_HISTORY_MESSAGES) {
-            return history;
-        }
-        // 附件预算在这个裁剪结果上算，否则会为随后被裁掉的消息白读一遍磁盘
-        return history.subList(size - Prompt.MAX_HISTORY_MESSAGES, size);
-    }
-
-    private static long totalBytes(List<Attachment> attachments) {
-        return attachments.stream().mapToLong(ChatStreamService::sizeOf).sum();
-    }
-
-    private static long sizeOf(Attachment attachment) {
-        return attachment.getFileSize() == null ? 0L : attachment.getFileSize();
     }
 
     private static String briefReason(Throwable error) {
