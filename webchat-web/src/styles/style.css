@@ -168,6 +168,14 @@
   body {
     @apply bg-background text-foreground font-sans antialiased;
   }
+  /* Tailwind 3 的 preflight 有 button { cursor: pointer }，4 把它去掉了，浏览器给按钮的默认光标是箭头，
+     于是「+」「发送」「收起侧边栏」这些按钮悬浮上去都不变手。这里统一补回来，不给每个按钮各写一遍。
+     base 层在 utilities 之下，所以禁用态（disabled:cursor-not-allowed）与下拉菜单项
+     （shadcn 的 cursor-default）各自的选择照旧生效 */
+  button:not(:disabled),
+  [role='button']:not([aria-disabled='true']) {
+    cursor: pointer;
+  }
 }
 
 /* Markdown 正文排版。Tailwind 的 preflight 清空了浏览器默认样式，这里逐项补回来 */
