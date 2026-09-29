@@ -2,8 +2,8 @@ package com.webchat.ai;
 
 import dev.langchain4j.data.message.Content;
 import dev.langchain4j.service.MemoryId;
+import dev.langchain4j.service.TokenStream;
 import dev.langchain4j.service.UserMessage;
-import reactor.core.publisher.Flux;
 
 import java.util.List;
 
@@ -30,12 +30,21 @@ import java.util.List;
  *       加了注解的这一条路则是把我们给的内容原样用上，见 {@code DefaultAiServices#addContentsToUserMessage}</li>
  * </ol>
  *
+ * <p><b>返回 {@link TokenStream} 而不是 {@code Flux<String>}</b>：后者由
+ * {@code langchain4j-reactor} 的适配器代劳，而那个适配器只接了
+ * {@code onPartialResponse} / {@code onCompleteResponse} / {@code onError} 三个回调
+ * （见 {@code TokenStreamToFluxAdapter#adapt}），工具调用<b>一概看不到</b>。
+ * 而联网搜索期间模型不吐字，前端要显示「正在搜索…」就得拿到
+ * {@code beforeToolExecution}——所以这里交回原始的 TokenStream，由
+ * {@link ChatStreamService} 自己接线。
+ *
  * @param conversationId 会话 ID，同时是记忆的槽位号
  * @param question       本轮提问的全部内容，顺序见 {@link ChatMessageAssembler#renderQuestion}；
  *                       检索到的资料由调用方拼在最前面，不在这里
- * @return 增量文本流；一字未吐就结束、或中途报错，分别由订阅方按「空回复」「生成失败」收场
+ * @return 未经接线的令牌流：调用方必须自行接上回调并调用 {@code start()}。
+ *         一字未吐就结束、或中途报错，分别由调用方按「空回复」「生成失败」收场
  */
 public interface ChatAssistant {
 
-    Flux<String> chat(@MemoryId Long conversationId, @UserMessage List<Content> question);
+    TokenStream chat(@MemoryId Long conversationId, @UserMessage List<Content> question);
 }

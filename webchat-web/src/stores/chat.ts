@@ -56,6 +56,13 @@ export const useChatStore = defineStore('chat', () => {
   /** 正在流式接收、尚未成为正式消息的助手回复 */
   const streamingText = ref('')
   const streaming = ref(false)
+  /**
+   * 正在执行中的工具名（眼下只有联网搜索那两个），空串表示没在跑。
+   *
+   * 工具执行期间模型不吐字，只有这条能说明「还在动」——所以它得活到工具跑完为止，
+   * 由下面的 search / delta 两种事件分别置位与清空。
+   */
+  const searchingTool = ref('')
   const loadingConversations = ref(false)
   const loadingMessages = ref(false)
   const errorMessage = ref('')
@@ -91,6 +98,21 @@ export const useChatStore = defineStore('chat', () => {
   const currentConversation = computed(
     () => conversations.value.find((item) => item.id === currentId.value) ?? null,
   )
+
+  /** 正在联网搜索时给界面的一句话；空串表示没在跑工具 */
+  const searchingLabel = computed(() => {
+    switch (searchingTool.value) {
+      case 'web_search_exa':
+        return '正在联网搜索…'
+      case 'web_fetch_exa':
+        return '正在读取网页…'
+      case '':
+        return ''
+      default:
+        // 后端加了新工具而前端还没跟上：说得含糊些，也比一声不吭强
+        return '正在使用工具…'
+    }
+  })
 
   /** 当前会话没有任何内容——用于显示空状态 */
   const isConversationEmpty = computed(
@@ -405,6 +427,7 @@ export const useChatStore = defineStore('chat', () => {
     const streamConversationId = currentId.value
     streaming.value = true
     streamingText.value = ''
+    searchingTool.value = ''
     errorMessage.value = ''
     let failed = false
     let replied = false
@@ -458,6 +481,11 @@ export const useChatStore = defineStore('chat', () => {
           onDelta: (chunk) => {
             produced += chunk
             streamingText.value += chunk
+            // 又开始吐字了，说明上一个工具已经跑完（这一轮可能还有下一个，下一个事件会再置位）
+            searchingTool.value = ''
+          },
+          onSearch: (tool) => {
+            searchingTool.value = tool
           },
           onDone: (messageId) => {
             messages.value.push({
@@ -490,6 +518,7 @@ export const useChatStore = defineStore('chat', () => {
       )
     } finally {
       streaming.value = false
+      searchingTool.value = ''
       // 已经生成的半截内容不能再丢：后端在出错与断开两种收场下都把它落了库，
       // 本地丢掉就会出现「刷新一下内容自己冒出来」的错位
       if (!replied) {
@@ -546,6 +575,7 @@ export const useChatStore = defineStore('chat', () => {
     abortController = null
     streaming.value = false
     streamingText.value = ''
+    searchingTool.value = ''
   }
 
   function toggleSidebar(): void {
@@ -585,6 +615,7 @@ export const useChatStore = defineStore('chat', () => {
     messages,
     streamingText,
     streaming,
+    searchingLabel,
     loadingConversations,
     loadingMessages,
     errorMessage,

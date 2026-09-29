@@ -1,5 +1,6 @@
 package com.webchat.ai;
 
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.internal.AsyncNotSupported;
@@ -14,6 +15,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Flow;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -42,16 +44,42 @@ class FakeStreamingChatModel implements StreamingChatModel {
 
     /** 依次吐出这些片段后正常结束。ChatResponse 里带上累计正文——框架会把它追加进记忆 */
     void emits(String... tokens) {
+        script = handler -> emit(handler, tokens);
+    }
+
+    /**
+     * 第一次调用回一个工具调用请求，之后的调用（框架执行完工具、把结果带回来再问一次）按 tokens 吐字。
+     *
+     * <p>即真实的一轮「先搜再答」：第一次请求模型一个字都不说，只点了个工具。
+     */
+    void callsToolThenEmits(String toolName, String arguments, String... tokens) {
+        AtomicBoolean firstCall = new AtomicBoolean(true);
         script = handler -> {
-            StringBuilder text = new StringBuilder();
-            for (String token : tokens) {
-                text.append(token);
-                handler.onPartialResponse(token);
+            if (firstCall.getAndSet(false)) {
+                handler.onCompleteResponse(ChatResponse.builder()
+                        .aiMessage(AiMessage.builder()
+                                .toolExecutionRequests(List.of(ToolExecutionRequest.builder()
+                                        .id("call-1")
+                                        .name(toolName)
+                                        .arguments(arguments)
+                                        .build()))
+                                .build())
+                        .build());
+                return;
             }
-            handler.onCompleteResponse(ChatResponse.builder()
-                    .aiMessage(AiMessage.from(text.toString()))
-                    .build());
+            emit(handler, tokens);
         };
+    }
+
+    private static void emit(StreamingChatResponseHandler handler, String... tokens) {
+        StringBuilder text = new StringBuilder();
+        for (String token : tokens) {
+            text.append(token);
+            handler.onPartialResponse(token);
+        }
+        handler.onCompleteResponse(ChatResponse.builder()
+                .aiMessage(AiMessage.from(text.toString()))
+                .build());
     }
 
     /** 吐一个片段后报错 */
@@ -67,6 +95,10 @@ class FakeStreamingChatModel implements StreamingChatModel {
      *
      * <p>真实的取消由容器察觉客户端断开后触发，测试里只能自己制造——先拿到 handler，
      * 手动推一个增量，再取消订阅。
+     *
+     * <p>推增量时用哪个重载由测试决定：走 {@code onPartialResponse(String)} 就是框架眼里
+     * 「本模型不支持取消」的那条路，走带 {@code PartialResponseContext} 的那个则带着真的把手，
+     * 可以把 {@code ChatStreamService} 的取消行为一并测掉。
      */
     AtomicReference<StreamingChatResponseHandler> handsOverHandler(CountDownLatch called) {
         AtomicReference<StreamingChatResponseHandler> handler = new AtomicReference<>();

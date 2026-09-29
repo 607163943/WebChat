@@ -13,6 +13,7 @@ import com.webchat.mapper.ConversationMapper;
 import com.webchat.mapper.MessageMapper;
 import com.webchat.service.AttachmentService;
 import com.webchat.service.ConversationService;
+import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.ImageContent;
@@ -20,6 +21,12 @@ import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.TextContent;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.data.message.VideoContent;
+import dev.langchain4j.model.chat.response.PartialResponse;
+import dev.langchain4j.model.chat.response.PartialResponseContext;
+import dev.langchain4j.model.chat.response.PartialToolCall;
+import dev.langchain4j.model.chat.response.PartialToolCallContext;
+import dev.langchain4j.model.chat.response.StreamingHandle;
+import dev.langchain4j.service.tool.ToolProviderResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -32,7 +39,9 @@ import reactor.core.Disposable;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -91,22 +100,37 @@ class ChatStreamServiceTests {
 
     private final FakeStreamingChatModel model = new FakeStreamingChatModel();
     private final ConversationMemoryStore memoryStore = new ConversationMemoryStore();
+    private ChatMessageAssembler messageAssembler;
     private ChatStreamService service;
 
     @BeforeEach
     void setUp() {
         // 与 AssistantConfig 用同一处装配：记忆与消息组装都走真的框架实现，测试才说明得了问题。
         // 装配写在 setUp 里而不是字段初始化里——@Mock 的字段要到这时才被注入
-        ChatMessageAssembler messageAssembler =
-                new ChatMessageAssembler(attachmentService, attachmentProperties);
-        ChatAssistant assistant = new AssistantConfig().chatAssistant(model, memoryStore);
-        service = new ChatStreamService(assistant, memoryStore, messageAssembler, conversationMapper,
-                messageMapper, conversationService, attachmentService, currentUserProvider,
-                titleGenerator, documentIndexService, ragProperties);
+        messageAssembler = new ChatMessageAssembler(attachmentService, attachmentProperties);
+        // 第三个参数是工具提供者：null 即「这一轮模型手上没有工具」，多数用例与联网搜索无关
+        installService(new AssistantConfig().chatAssistant(model, memoryStore, null));
         // 检索默认返回「没有资料」：多数用例测的是事件编排，与 RAG 无关。
         // 必须显式 stub —— mock 默认返回 null，而 Mono.fromCallable 拿到 null 会变成空流，
         // 表现是一次 delta 都收不到，排查起来会莫名其妙
         lenient().when(documentIndexService.knowledgeFor(any(), any())).thenReturn("");
+    }
+
+    /** 用给定的助手重装一遍 service：联网搜索那条用例需要一个手上有工具的助手 */
+    private void installService(ChatAssistant assistant) {
+        service = new ChatStreamService(assistant, memoryStore, messageAssembler, conversationMapper,
+                messageMapper, conversationService, attachmentService, currentUserProvider,
+                titleGenerator, documentIndexService, ragProperties);
+    }
+
+    /** 装配一个「模型手上有一个联网搜索工具」的助手，用来跑搜索事件那条用例 */
+    private void installAssistantWithSearchTool() {
+        ToolSpecification specification = ToolSpecification.builder()
+                .name("web_search_exa")
+                .description("联网搜索")
+                .build();
+        installService(new AssistantConfig().chatAssistant(model, memoryStore,
+                request -> new ToolProviderResult(Map.of(specification, (request1, memoryId) -> "搜索结果"))));
     }
 
     /** 落库时回填自增主键，模拟 MyBatis-Plus 的行为 */
@@ -197,6 +221,37 @@ class ChatStreamServiceTests {
                 new ChatEvent.Done(42L),
                 new ChatEvent.Title("问候"));
         verify(conversationMapper).updateTitle(1L, 7L, "问候");
+    }
+
+    @Test
+    @DisplayName("模型调用联网搜索：searching 插在 delta 之前，工具名原样上报")
+    void emitsSearchingEventWhileAToolRuns() {
+        installAssistantWithSearchTool();
+        model.callsToolThenEmits("web_search_exa", "{\"query\":\"今天天气\"}", "晴");
+        assistantInsertReturns(42L);
+        seedSystemPrompt();
+
+        List<ChatEvent> events = collect(contextOf(false, "你好"));
+
+        // 「先搜再答」那一轮：模型一个字都没说就先点了工具，搜索期间唯一的动静就是这条事件。
+        // 工具名照原样发出去——翻译成「正在联网搜索…」是前端的事，后端不管界面文案
+        assertThat(events).containsExactly(
+                new ChatEvent.Searching("web_search_exa"),
+                new ChatEvent.Delta("晴"),
+                new ChatEvent.Done(42L));
+    }
+
+    @Test
+    @DisplayName("没有工具时不会冒出 searching：事件流与从前一样")
+    void emitsNoSearchingEventWithoutTools() {
+        model.emits("你", "好");
+        assistantInsertReturns(42L);
+        seedSystemPrompt();
+
+        assertThat(collect(contextOf(false, "你好"))).containsExactly(
+                new ChatEvent.Delta("你"),
+                new ChatEvent.Delta("好"),
+                new ChatEvent.Done(42L));
     }
 
     @Test
@@ -382,7 +437,8 @@ class ChatStreamServiceTests {
         handler.get().onPartialResponse("半截");
         subscription.dispose();
         assertThat(saved.await(5, TimeUnit.SECONDS)).isTrue();
-        // 真实适配器停不下来，断开之后仍可能走完成回调。这次晚到的调用必须被吞掉：
+        // 这条假模型走的是不带上下文的重载，也就是「不支持取消」那条路；真实适配器即使能被掐断，
+        // 也仍存在掐断与完成回调擦身而过的可能。这次晚到的调用必须被吞掉：
         // singleSavedReply() 断言全轮只 insert 过一次，重复写会让它失败
         handler.get().onCompleteResponse(dev.langchain4j.model.chat.response.ChatResponse.builder()
                 .aiMessage(AiMessage.from("半截"))
@@ -390,6 +446,99 @@ class ChatStreamServiceTests {
 
         assertThat(singleSavedReply().getStatus()).isEqualTo(Message.STATUS_INTERRUPTED);
         verify(messageMapper, never()).updateReply(anyLong(), anyLong(), anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("断开时把模型那边的生成也掐掉：不只是停止投递")
+    void cancelsTheModelGenerationWhenClientDisconnects() throws Exception {
+        RecordingStreamingHandle handle = new RecordingStreamingHandle();
+        CountDownLatch modelCalled = new CountDownLatch(1);
+        AtomicReference<dev.langchain4j.model.chat.response.StreamingChatResponseHandler> handler =
+                model.handsOverHandler(modelCalled);
+        CountDownLatch saved = new CountDownLatch(1);
+        assistantInsertReturns(62L, saved);
+
+        Disposable subscription = service.stream(contextOf(false, "你好")).subscribe();
+        assertThat(modelCalled.await(5, TimeUnit.SECONDS)).isTrue();
+        // 真实适配器走的是带上下文的重载（DashScope 调的就是它），把手就在上下文里
+        handler.get().onPartialResponse(new PartialResponse("半截"),
+                new PartialResponseContext(handle));
+        subscription.dispose();
+        assertThat(saved.await(5, TimeUnit.SECONDS)).isTrue();
+
+        // 没有这一步的话，用户那边看着像停了，模型其实在后台把整段话生成完，额度照扣
+        assertThat(handle.cancelCount()).isEqualTo(1);
+        assertThat(handle.isCancelled()).isTrue();
+        assertThat(singleSavedReply().getStatus()).isEqualTo(Message.STATUS_INTERRUPTED);
+    }
+
+    @Test
+    @DisplayName("模型还没吐字就断开：把手一到手就补上那一刀")
+    void cancelsTheModelWhenDisconnectHappensBeforeAnyToken() throws Exception {
+        RecordingStreamingHandle handle = new RecordingStreamingHandle();
+        CountDownLatch modelCalled = new CountDownLatch(1);
+        AtomicReference<dev.langchain4j.model.chat.response.StreamingChatResponseHandler> handler =
+                model.handsOverHandler(modelCalled);
+
+        Disposable subscription = service.stream(contextOf(false, "你好")).subscribe();
+        assertThat(modelCalled.await(5, TimeUnit.SECONDS)).isTrue();
+        // 一个增量都还没有：此时候手还没到手，断开只能先记下「已取消」
+        subscription.dispose();
+
+        // 模型随后才吐出第一个增量——这也正是「模型刚开个头就被停掉」那种情形
+        handler.get().onPartialResponse(new PartialResponse("半截"),
+                new PartialResponseContext(handle));
+
+        assertThat(handle.cancelCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("模型先点工具、还没吐字时断开：靠工具调用那条回调提前拿到的把手也能掐断")
+    void cancelsThroughTheToolCallHandleBeforeAnyToken() throws Exception {
+        RecordingStreamingHandle handle = new RecordingStreamingHandle();
+        CountDownLatch modelCalled = new CountDownLatch(1);
+        AtomicReference<dev.langchain4j.model.chat.response.StreamingChatResponseHandler> handler =
+                model.handsOverHandler(modelCalled);
+        installAssistantWithSearchTool();
+
+        Disposable subscription = service.stream(contextOf(false, "你好")).subscribe();
+        assertThat(modelCalled.await(5, TimeUnit.SECONDS)).isTrue();
+        // 「先搜再答」那一轮的顺序：模型只点了个工具，一个字都还没说，第一个文本增量要等搜索结束才来
+        subscription.dispose();
+
+        handler.get().onPartialToolCall(PartialToolCall.builder()
+                        .index(0)
+                        .id("call-1")
+                        .name("web_search_exa")
+                        .partialArguments("{\"query\":\"今天天气\"}")
+                        .build(),
+                new PartialToolCallContext(handle));
+
+        // 只认 onPartialResponseWithContext 的话，这一刀要等到搜索跑完才落得下去——
+        // 而搜索本身要几秒，用户点的「停止」在搜索期间等于没生效
+        assertThat(handle.cancelCount()).isEqualTo(1);
+    }
+
+    /** 可观测的把手：真实适配器把它藏在 {@code PartialResponseContext} 里递给框架 */
+    private static final class RecordingStreamingHandle implements StreamingHandle {
+
+        private final AtomicInteger cancels = new AtomicInteger();
+        private volatile boolean cancelled;
+
+        @Override
+        public void cancel() {
+            cancelled = true;
+            cancels.incrementAndGet();
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return cancelled;
+        }
+
+        int cancelCount() {
+            return cancels.get();
+        }
     }
 
     // ---------------------------------------------------------------- 记忆

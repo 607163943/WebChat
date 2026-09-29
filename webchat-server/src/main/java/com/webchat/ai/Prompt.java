@@ -8,10 +8,19 @@ public final class Prompt {
     private Prompt() {
     }
 
-    /** 系统提示词。当前阶段固定为代码常量，不落库 */
+    /**
+     * 系统提示词。当前阶段固定为代码常量，不落库。
+     *
+     * <p>末段是联网搜索的用法说明。工具本身由 MCP 服务提供、自带描述，但<b>什么时候该用</b>得由
+     * 这里说清：不写的话模型要么守着记忆里的旧知识硬答，要么反过来凡事都先搜一遍——后者每次
+     * 要多花几秒，而多数问题（写代码、算数、改文案）根本不需要联网。
+     */
     public static final String SYSTEM_PROMPT = """
             你是 WebChat 的 AI 助手，请用简洁、准确的中文回答问题。
-            回答使用 Markdown 格式：代码放进带语言标注的代码块，适当使用列表与小标题。""";
+            回答使用 Markdown 格式：代码放进带语言标注的代码块，适当使用列表与小标题。
+            你有联网搜索工具：需要最新消息、版本号、价格、时事等可能已经变化的信息，或你对答案
+            没有把握时，先用 web_search_exa 搜索、必要时用 web_fetch_exa 打开具体网页再回答；
+            引用了搜索结果时给出可点击的来源链接。稳定的常识、写作与代码问题不必搜索。""";
 
     /** 标题生成提示词模板，参数为用户的首条提问 */
     public static final String TITLE_PROMPT_TEMPLATE = """
@@ -63,4 +72,12 @@ public final class Prompt {
      * 即最多约 16000 字符，这里取 8000 留足余量。
      */
     public static final int MAX_USER_MESSAGE_LENGTH = 8000;
+
+    /**
+     * 一轮提问里最多来回几次工具调用（联网搜索）。
+     *
+     * <p>不设上限时模型可能反复搜同一件事，而每次搜索都要几秒——用户那边就是一段没有尽头的
+     * 「正在搜索…」。到顶之后框架不再执行工具，模型只能就手上的信息作答。
+     */
+    public static final int MAX_TOOL_CALLING_ROUND_TRIPS = 4;
 }

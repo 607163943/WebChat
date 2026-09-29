@@ -10,6 +10,8 @@ import org.springframework.web.context.request.async.AsyncRequestNotUsableExcept
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
+import java.io.IOException;
+
 /**
  * 全局异常处理，把异常统一收敛成 {@link Result}。
  *
@@ -39,6 +41,24 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(AsyncRequestNotUsableException.class)
     public void handleClientAbort(AsyncRequestNotUsableException e) {
         log.info("客户端已断开，不再写出剩余响应：{}", e.getMessage());
+    }
+
+    /**
+     * 同一件事的另一种面孔：客户端断开是从「写响应」那一步炸出来的。
+     *
+     * <p>Spring 只在部分路径上把写失败包装成 {@link AsyncRequestNotUsableException}；异步派发
+     * （SSE 走的正是这条）上抛出来的往往是底层的 {@link IOException}——Windows 上是「你的主机中的
+     * 软件中止了一个已建立的连接」，Linux 上是 {@code Broken pipe}。它落到兜底分支就会在每次
+     * 「停止生成」时留下一条满屏堆栈的 ERROR，而那是服务端真出问题才有的待遇。
+     *
+     * <p>这个 handler 敢收得这么宽，是因为本应用<b>不会</b>把 IOException 抛到这里：唯一的本地
+     * 文件读取（{@code AttachmentController}）当场就转成了 {@link BizException}，
+     * 存储层的失败也走 {@code AttachmentStorageException}（RuntimeException）。所以到这一层的
+     * IOException 就是写响应失败。响应都写不出去了，构造 {@link Result} 也无处可送，直接结束。
+     */
+    @ExceptionHandler(IOException.class)
+    public void handleWriteFailure(IOException e) {
+        log.info("写出响应失败，客户端多半已经断开：{}", e.getMessage());
     }
 
     /**

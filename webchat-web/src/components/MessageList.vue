@@ -15,6 +15,8 @@ const props = defineProps<{
   messages: ChatMessage[]
   streamingText: string
   streaming: boolean
+  /** 正在跑工具时的一句话（如「正在联网搜索…」）；空串表示没在跑 */
+  searchingLabel: string
 }>()
 
 const emit = defineEmits<{ regenerate: [] }>()
@@ -114,11 +116,16 @@ defineExpose({ stickToBottom })
       </template>
 
       <div v-if="props.streaming" class="flex flex-col gap-3">
-        <TypingIndicator v-if="!props.streamingText" />
         <!-- 流式期间也走 Markdown，未闭合的代码围栏由 renderMarkdown 补齐 -->
-        <div v-else class="text-fg-secondary text-[14px] leading-[1.65]">
+        <div v-if="props.streamingText" class="text-fg-secondary text-[14px] leading-[1.65]">
           <MarkdownContent :content="props.streamingText" />
         </div>
+        <!-- 已经在吐字之后的搜索：模型可能先说一句「我查一下」再去搜，此时指示器挂在正文下面。
+             没有正文时它就是那个等首个片段的气泡 -->
+        <TypingIndicator
+          v-if="!props.streamingText || props.searchingLabel"
+          :label="props.searchingLabel"
+        />
       </div>
     </div>
   </div>

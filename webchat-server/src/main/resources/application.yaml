@@ -28,13 +28,13 @@ langchain4j:
     dashscope:
       embedding-model:
         model-name: qwen3.7-text-embedding-flash
-        api-key: ${QWEN_API_KEY}
+        api-key: ${CHAT_MODEL_API_KEY}
       chat-model:
-        api-key: ${QWEN_API_KEY}
+        api-key: ${CHAT_MODEL_API_KEY}
         model-name: qwen3.8-max
       # 流式模型是独立的配置前缀，不配这段就不会有 StreamingChatModel bean
       streaming-chat-model:
-        api-key: ${QWEN_API_KEY}
+        api-key: ${CHAT_MODEL_API_KEY}
         model-name: qwen3.8-max
 # 附件：本地磁盘存储 + 多模态输入的相关上限。绑定与初始化见 config/AttachmentProperties
 webchat:
@@ -53,6 +53,14 @@ webchat:
     # 清理任务的扫描间隔，同时用作首次执行的延迟（@Scheduled 接受 30m 这种简单写法）
     cleanup-interval: 30m
     retry-alert-threshold: 5
+  # 联网搜索：把 Exa 的 MCP 服务接成一组模型可自主调用的工具（web_search_exa / web_fetch_exa）。
+  # 连接是懒建的——没配密钥、Exa 不通都不影响启动与其余功能，只是模型手上没有工具
+  search:
+    # 关掉即可整体停用，不必删密钥
+    enabled: true
+    # 密钥走查询参数发给 MCP 服务（Exa 只认这个参数），所以拼出来的 URL 不能进日志
+    api-key: ${MCP_SEARCH_API_KEY:}
+    # 其余可调项（端点、工具白名单、超时）用 SearchProperties 里的默认值
   # 文本附件的检索（RAG）。纯内存向量库，重启即失效，已绑定的附件要重新上传才有检索
   rag:
     max-results: 5

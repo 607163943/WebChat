@@ -10,14 +10,9 @@ import dev.langchain4j.data.message.UserMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import reactor.core.Disposable;
 
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -30,6 +25,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 见 {@link ChatAssistant} 的说明）。框架升级后这里要是红了，说明那套假设不成立了。
  *
  * <p>用假的 {@link FakeStreamingChatModel} 驱动，不联网、不碰数据库。
+ *
+ * <p>工具调用那条线（联网搜索所依赖的）在 {@link ChatAssistantToolTests} 里，
+ * 这里装配的是不带工具的助手。
  */
 class ChatAssistantTests {
 
@@ -42,8 +40,9 @@ class ChatAssistantTests {
 
     @BeforeEach
     void setUp() {
-        // 与 AssistantConfig 用同一处装配，避免测试里再抄一份、抄歪了还测不出来
-        assistant = new AssistantConfig().chatAssistant(model, memoryStore);
+        // 与 AssistantConfig 用同一处装配，避免测试里再抄一份、抄歪了还测不出来。
+        // 第三个参数是工具提供者：null 即「没有工具」，正是这条测试要的那条路
+        assistant = new AssistantConfig().chatAssistant(model, memoryStore, null);
     }
 
     /** 按 ChatStreamService 的传法灌一份记忆：系统提示词在最前，随后是历史 */
@@ -56,9 +55,7 @@ class ChatAssistantTests {
 
     private List<String> ask(List<Content> question) {
         model.emits("答");
-        return assistant.chat(CONVERSATION_ID, question)
-                .collectList()
-                .block(Duration.ofSeconds(5));
+        return TokenStreamRecorder.start(assistant.chat(CONVERSATION_ID, question)).tokens();
     }
 
     /** 发出去的那条本轮提问 */
@@ -125,33 +122,13 @@ class ChatAssistantTests {
         seed(List.of());
         model.failsAfter("半截", new RuntimeException("模型挂了"));
 
-        List<String> tokens = assistant.chat(CONVERSATION_ID, List.of(TextContent.from("这一问")))
-                .onErrorReturn("ERR")
-                .collectList()
-                .block(Duration.ofSeconds(5));
+        TokenStreamRecorder recorder =
+                TokenStreamRecorder.start(assistant.chat(CONVERSATION_ID, List.of(TextContent.from("这一问"))));
 
-        assertThat(tokens).containsExactly("半截", "ERR");
-        // 记忆里只剩本轮提问——半截回复要落库、要让下一轮看见，只能由我们自己做（见 ChatStreamService）
-        assertThat(memoryStore.getMessages(CONVERSATION_ID)).containsExactly(
-                SystemMessage.from(Prompt.SYSTEM_PROMPT), UserMessage.from("这一问"));
-    }
-
-    @Test
-    @DisplayName("取消订阅时框架不留半条助手消息在记忆里")
-    void cancellationLeavesNoAssistantMessageInMemory() throws Exception {
-        seed(List.of());
-        CountDownLatch called = new CountDownLatch(1);
-        AtomicReference<dev.langchain4j.model.chat.response.StreamingChatResponseHandler> handler =
-                model.handsOverHandler(called);
-
-        Disposable subscription = assistant.chat(CONVERSATION_ID, List.of(TextContent.from("这一问")))
-                .subscribe();
-        assertThat(called.await(5, TimeUnit.SECONDS)).isTrue();
-        handler.get().onPartialResponse("半截");
-        subscription.dispose();
-        // 断开之后的收尾是异步的，给它一点时间再断言「什么都没留下」
-        Thread.sleep(300);
-
+        // 出错前的增量已经到手，错也如实报了出来——收场归调用方（见 ChatStreamService 的 failureEvents）
+        assertThat(recorder.tokens()).containsExactly("半截");
+        assertThat(recorder.errorAfter()).hasMessage("模型挂了");
+        // 记忆里只剩本轮提问——半截回复要落库、要让下一轮看见，只能由我们自己做
         assertThat(memoryStore.getMessages(CONVERSATION_ID)).containsExactly(
                 SystemMessage.from(Prompt.SYSTEM_PROMPT), UserMessage.from("这一问"));
     }

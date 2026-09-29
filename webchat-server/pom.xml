@@ -82,6 +82,12 @@
 			<artifactId>langchain4j-community-dashscope-spring-boot-starter</artifactId>
 			<version>1.20.0-beta30</version>
 		</dependency>
+		<!--LangChain4j MCP-->
+		<dependency>
+			<groupId>dev.langchain4j</groupId>
+			<artifactId>langchain4j-mcp</artifactId>
+			<version>1.20.0-beta30</version>
+		</dependency>
 		<!--Reactor：SSE 接口返回 Flux 需要，spring-boot-starter-web 不带它，
 		    目前仅由 langchain4j-reactor 传递引入，显式声明以免日后清理依赖时运行时炸-->
 		<dependency>

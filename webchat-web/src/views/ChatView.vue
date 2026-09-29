@@ -221,6 +221,7 @@ onBeforeUnmount(() => {
           :messages="chat.messages"
           :streaming-text="chat.streamingText"
           :streaming="chat.streaming"
+          :searching-label="chat.searchingLabel"
           @regenerate="chat.regenerateLast"
         />
       </Transition>

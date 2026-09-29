@@ -14,11 +14,13 @@ import com.webchat.mapper.MessageMapper;
 import com.webchat.service.AttachmentService;
 import com.webchat.service.ConversationService;
 import dev.langchain4j.data.message.Content;
+import dev.langchain4j.model.chat.response.StreamingHandle;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
@@ -174,43 +176,82 @@ public class ChatStreamService {
      * 一次生成：把模型吐出的增量变成 delta 事件，并在收尾时落库。
      *
      * <p>三种收场都要落库，靠 {@link ReplyState} 这个「谁写」的仲裁者区分：正常结束由完成回调写、
-     * 报错由失败分支写、客户端断开由取消回调写。几个算子各自的职责见方法内注释。
+     * 报错由失败分支写、客户端断开由取消回调写。几个回调各自的职责见方法内注释。
      */
     private Flux<ChatEvent> replyFlux(ChatContext context, String knowledge) {
         List<Content> question = ChatMessageAssembler.withKnowledge(context.currentContents(), knowledge);
         ReplyState state = new ReplyState();
-        // defer 是必要的：真正的调用发生在订阅时，也就是下面 subscribeOn 切过去的弹性线程上，
+        // create 天然就是「订阅时才跑」：真正的模型调用发生在下面 subscribeOn 切过去的弹性线程上，
         // 而不是控制器的 Tomcat 线程上
-        return Flux.defer(() -> chatAssistant.chat(context.conversationId(), question))
-                // 只累计、不下发：断开之后模型可能还会吐几个增量，累计到快照里没有意义，
-                // 而「发不发得出去」由下游是否已取消决定
-                .doOnNext(state::append)
-                .<ChatEvent>map(ChatEvent.Delta::new)
-                // 正常结束：取走正文并落库，发 done（或「模型没返回任何内容」）
-                .concatWith(Flux.defer(() -> completionEvents(context, state)))
-                // 生成中途报错：把出错前已生成的部分落库为 failed，再以 error 事件收场。
-                // 吞掉异常而不是继续向外抛：响应提交之后再抛会重新进入 Spring 的异常解析器，
-                // 可能把 JSON 错误体追加进已经开始输出的 SSE 流
-                .onErrorResume(error -> failureEvents(context, state, error))
+        return Flux.<ChatEvent>create(sink -> startGeneration(context, question, state, sink))
                 // 客户端断开：用户点「停止生成」、切会话、关页面，服务端看到的都是这一条路。
-                // 把断开那一刻已经生成的部分落库——用户看过这段内容，刷新后它不该凭空消失
-                .doOnCancel(() -> saveInterrupted(context, state))
+                // 这一层刻意留在 create 外面（而不是写成 sink.onCancel）：订阅之前就取消时，
+                // FluxSink 上的取消回调会被直接丢掉而不执行，挂在 Flux 上的这个算子才是稳的
+                .doOnCancel(() -> interrupt(context, state))
                 // 让模型调用、检索与随后的落库都离开 Tomcat 请求线程
                 .subscribeOn(Schedulers.boundedElastic());
     }
 
+    /**
+     * 把这一次生成接到事件槽上。
+     *
+     * <p>之所以自己接线而不用 {@code Flux<String>}：工具调用（联网搜索）只有 TokenStream 上才有回调，
+     * 而搜索期间模型不吐字，前端那几秒的「正在搜索…」全靠 {@code beforeToolExecution} 这条。
+     * 详见 {@link ChatAssistant}。
+     *
+     * <p>两个收场回调都<b>只发事件、不抛异常</b>：此刻响应早已提交，向外抛只会让 Spring 的异常解析器
+     * 往已经开始输出的 SSE 流里再追一个 JSON 错误体。
+     */
+    private void startGeneration(ChatContext context, List<Content> question,
+                                 ReplyState state, FluxSink<ChatEvent> sink) {
+        try {
+            chatAssistant.chat(context.conversationId(), question)
+                    // 用带上下文的那一个重载（不带上下文的拿不到 StreamingHandle，框架给的是个
+                    // 一调用就抛「本模型不支持取消」的占位把手，也就没法真正掐断生成）
+                    // 累计与下发在同一处：累计不能挪到下游去——断开之后模型可能还会吐几个增量，
+                    // 那些不该进快照，必须和「发不发得出去」同一个判据
+                    .onPartialResponseWithContext((partialResponse, responseContext) -> {
+                        state.attachHandle(responseContext.streamingHandle());
+                        String token = partialResponse.text();
+                        state.append(token);
+                        sink.next(new ChatEvent.Delta(token));
+                    })
+                    // 只为了早点拿到把手：模型「先点工具再说话」那一轮，第一个文本增量要到搜索结束
+                    // 之后才来，而用户完全可能在搜索期间就点了停止。工具的增量内容我们本来也不展示
+                    .onPartialToolCallWithContext((partialToolCall, callContext) ->
+                            state.attachHandle(callContext.streamingHandle()))
+                    // 模型开始调工具（联网搜索）：这是执行期间唯一的动静
+                    .beforeToolExecution(execution ->
+                            sink.next(new ChatEvent.Searching(execution.request().name())))
+                    // 正常结束：取走正文并落库，发 done（或「模型没返回任何内容」）
+                    .onCompleteResponse(response -> emit(sink, completionEvents(context, state)))
+                    // 生成中途报错：把出错前已生成的部分落库为 failed，再以 error 事件收场
+                    .onError(error -> emit(sink, failureEvents(context, state, error)))
+                    .start();
+        } catch (RuntimeException e) {
+            // start() 自己就抛了（订阅没建成之类）：与模型中途报错同一种收场
+            emit(sink, failureEvents(context, state, e));
+        }
+    }
+
+    /** 发完一组事件就收尾。槽若已被取消，next 与 complete 都是空操作，不必另行判断 */
+    private static void emit(FluxSink<ChatEvent> sink, List<ChatEvent> events) {
+        events.forEach(sink::next);
+        sink.complete();
+    }
+
     /** 正常结束：落 completed，发 done；一个字都没生成时不落库，只发一条 error */
-    private Flux<ChatEvent> completionEvents(ChatContext context, ReplyState state) {
+    private List<ChatEvent> completionEvents(ChatContext context, ReplyState state) {
         String text = state.claim();
         if (text == null) {
             // 写入权已被取消路径取走：这一轮的内容早就不归这里管了
-            return Flux.empty();
+            return List.of();
         }
         if (text.isEmpty()) {
-            return Flux.just(new ChatEvent.Failed("模型没有返回任何内容"));
+            return List.of(new ChatEvent.Failed("模型没有返回任何内容"));
         }
         Long messageId = saveReply(context, text, Message.STATUS_COMPLETED);
-        return Flux.just(messageId == null
+        return List.of(messageId == null
                 ? new ChatEvent.Failed("回复保存失败")
                 : new ChatEvent.Done(messageId));
     }
@@ -220,25 +261,36 @@ public class ChatStreamService {
      *
      * <p>一个字都没生成时什么都不写：空消息既没有展示价值，作为历史发给模型也会出问题。
      */
-    private Flux<ChatEvent> failureEvents(ChatContext context, ReplyState state, Throwable error) {
-        log.error("流式生成失败，conversationId={}", context.conversationId(), error);
+    private List<ChatEvent> failureEvents(ChatContext context, ReplyState state, Throwable error) {
         String text = state.claim();
         if (text == null) {
-            // 客户端已经断开，取消路径先把这一轮写走了
-            return Flux.empty();
+            // 客户端已经断开，取消路径先把这一轮写走了。这里<b>刻意不记 ERROR</b>：
+            // 掐断生成时框架多半会回声一个异常，而用户主动点「停止」不是故障，
+            // 照记就会让每次停止都在日志里留一条吓人的堆栈
+            return List.of();
         }
+        log.error("流式生成失败，conversationId={}", context.conversationId(), error);
         if (!text.isEmpty()) {
             saveReply(context, text, Message.STATUS_FAILED);
         }
-        return Flux.just(new ChatEvent.Failed(briefReason(error)));
+        return List.of(new ChatEvent.Failed(briefReason(error)));
     }
 
-    /** 客户端断开：把断开那一刻的快照落库为 {@code interrupted}，一个字都没有时什么都不写 */
-    private void saveInterrupted(ChatContext context, ReplyState state) {
+    /**
+     * 客户端断开的收尾：先把断开那一刻的快照落库为 {@code interrupted}，再把模型那边的生成也掐掉。
+     *
+     * <p>顺序不能反。{@link ReplyState#cancelAndSnapshot} 同时也是「这一轮的写入权归取消路径」的声明，
+     * 先声明再取消，模型被掐断时可能回声的那一两个增量才既不会进快照、也不会重复写库。
+     *
+     * <p>一个字都没生成时什么都不写（与出错那条路一致），但<b>依然要取消</b>——恰恰是这种时候模型
+     * 往往刚开个头，不取消就会把整段生成完。
+     */
+    private void interrupt(ChatContext context, ReplyState state) {
         String snapshot = state.cancelAndSnapshot();
         if (snapshot != null && !snapshot.isEmpty()) {
             saveReply(context, snapshot, Message.STATUS_INTERRUPTED);
         }
+        state.cancelGeneration();
     }
 
     /**
@@ -280,7 +332,7 @@ public class ChatStreamService {
     }
 
     /**
-     * 一轮生成的共享状态：累计正文、是否已被取消、这次写入归谁。
+     * 一轮生成的共享状态：累计正文、是否已被取消、这次写入归谁，以及底层生成的把手。
      *
      * <p>取消信号与生成回调可能来自不同线程（模型推送线程、容器察觉断开的线程），
      * 所以全部改动都收在这一个监视器里。
@@ -288,16 +340,60 @@ public class ChatStreamService {
      * <p>「谁写」由返回值决定：{@link #cancelAndSnapshot} 与 {@link #claim} 互斥，
      * 只有一个能拿到非 null，所以半截内容与完整内容不会被写两次，也不需要额外的标记。
      */
+    @Slf4j
     private static final class ReplyState {
 
         private final StringBuilder accumulated = new StringBuilder();
         private boolean cancelled;
         private boolean claimed;
 
+        /** 底层这次生成的把手；模型一个增量都还没吐出来之前是 null */
+        private StreamingHandle handle;
+
         /** 追加一段增量；已被取消就丢掉——断开之后的增量不属于用户看到过的那段内容 */
         synchronized void append(String token) {
             if (!cancelled) {
                 accumulated.append(token);
+            }
+        }
+
+        /**
+         * 记下底层生成的把手，供断开时真正掐断模型那边。
+         *
+         * <p>把手要等模型吐出点东西才拿得到，而断开完全可能发生在拿到之前——所以这里得回头看一次：
+         * 已经断开的话，把手到手的第一时间就取消，否则那一轮模型会一路生成到底，
+         * 用户看不到，额度照扣。
+         */
+        synchronized void attachHandle(StreamingHandle handle) {
+            this.handle = handle;
+            if (cancelled) {
+                cancelHandleLocked();
+            }
+        }
+
+        /**
+         * 掐断模型那边的生成。
+         *
+         * <p>没有这一步，「停止生成」只是不再往下游投递：用户那边看着像停了，模型其实在后台把整段话
+         * 生成完。把手还没到手时什么都不做——它到手时 {@link #attachHandle} 会补上这一刀。
+         */
+        synchronized void cancelGeneration() {
+            if (handle == null) {
+                return;
+            }
+            cancelHandleLocked();
+        }
+
+        private void cancelHandleLocked() {
+            try {
+                handle.cancel();
+                // 留在 debug：这件事的结论已经写进库里那条 interrupted 了，正常跑不必刷屏；
+                // 而排查「停止生成到底有没有把模型掐断」时，它是唯一的证据
+                log.debug("已掐断底层的模型生成");
+            } catch (RuntimeException e) {
+                // 框架对不支持取消的模型会在这里抛（它给的是一个一调用就抛的占位把手）。
+                // 投递早就停了，用户视角这件事已经办成，不值得把一次「停止」变成报错，所以也只留 debug
+                log.debug("底层模型不支持取消进行中的生成，本次只停止了投递", e);
             }
         }
 

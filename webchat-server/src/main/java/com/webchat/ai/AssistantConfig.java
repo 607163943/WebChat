@@ -3,12 +3,14 @@ package com.webchat.ai;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.tool.ToolProvider;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.lang.Nullable;
 
 /**
- * 对话用 AI Service 的装配：模型与记忆在这里拼起来。
+ * 对话用 AI Service 的装配：模型、记忆与工具在这里拼起来。
  *
  * <p>记忆的实现是 {@link MessageWindowChatMemory}——按<b>消息条数</b>保留最近的若干条：
  * 条数比 token 数好估，而超长会话真正压垮请求的是条数，不是长度。窗口取
@@ -22,6 +24,10 @@ import org.springframework.context.annotation.Configuration;
  * <p>{@code alwaysKeepSystemMessageFirst} 必须开：窗口满了会从最旧的一条开始丢，
  * 而系统提示词正好是最旧的那条（由 {@link ChatMessageAssembler} 灌在历史最前面），
  * 不开的话长会话一过窗口就会把它挤掉，模型从此失去人设。
+ *
+ * <p><b>工具是可选的一路</b>：{@code toolProvider} 为 null 时（测试，或压根没装配搜索）
+ * 装配出来的就是一个纯对话的助手。生产里那个提供者来自 {@code com.webchat.ai.search}，
+ * 它自己再决定这一轮到底给不给工具——所以这里不必判断「联网是否可用」。
  */
 @Slf4j
 @Configuration
@@ -29,15 +35,20 @@ public class AssistantConfig {
 
     @Bean
     public ChatAssistant chatAssistant(StreamingChatModel streamingChatModel,
-                                       ConversationMemoryStore memoryStore) {
-        return AiServices.builder(ChatAssistant.class)
+                                       ConversationMemoryStore memoryStore,
+                                       @Nullable ToolProvider toolProvider) {
+        AiServices<ChatAssistant> assistant = AiServices.builder(ChatAssistant.class)
                 .streamingChatModel(streamingChatModel)
                 .chatMemoryProvider(memoryId -> MessageWindowChatMemory.builder()
                         .id(memoryId)
                         .maxMessages(Prompt.MAX_HISTORY_MESSAGES + 2)
                         .alwaysKeepSystemMessageFirst(true)
                         .chatMemoryStore(memoryStore)
-                        .build())
-                .build();
+                        .build());
+        if (toolProvider != null) {
+            assistant.toolProvider(toolProvider)
+                    .maxToolCallingRoundTrips(Prompt.MAX_TOOL_CALLING_ROUND_TRIPS);
+        }
+        return assistant.build();
     }
 }

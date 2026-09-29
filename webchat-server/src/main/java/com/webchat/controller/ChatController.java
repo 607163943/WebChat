@@ -29,6 +29,8 @@ public class ChatController {
     @Operation(summary = "发送消息（SSE 流式）", description = """
             返回 text/event-stream，不套 Result 信封。
             事件协议：若干 delta → done →（仅新会话）title；生成失败则以 error 结束。
+            模型调用联网搜索等工具时，会在 delta 之前或之间插入 search 事件（载荷是工具名），
+            表示服务端正在执行该工具、这几秒里不会有 delta。
             助手回复在三种收场下都会落库：正常结束 completed、生成出错 failed、用户中断 interrupted；
             出错与中断时存的是已生成的那部分，一个字都没生成则不落库。
             每条事件都必须带 event 名，事件体均为 JSON。""")
@@ -72,6 +74,10 @@ public class ChatController {
                     .event("delta")
                     .data(new DeltaPayload(delta.content()))
                     .build();
+            case ChatEvent.Searching searching -> ServerSentEvent.builder()
+                    .event("search")
+                    .data(new SearchPayload(searching.tool()))
+                    .build();
             case ChatEvent.Done done -> ServerSentEvent.builder()
                     .event("done")
                     .data(new DonePayload(done.messageId()))
@@ -88,6 +94,10 @@ public class ChatController {
     }
 
     record DeltaPayload(String content) {
+    }
+
+    /** 正在执行的工具名。给用户看的那句话由前端按它翻译，后端不做界面文案 */
+    record SearchPayload(String tool) {
     }
 
     record DonePayload(Long messageId) {

@@ -5,10 +5,18 @@ import { streamSse } from './sse'
  * 聊天流式接口的事件回调。
  *
  * 事件协议（手写约定，生成不出类型）：若干 delta → done →（仅新会话）title；失败则以 error 结束。
+ * 模型调用工具（联网搜索）时，search 会插在 delta 之前或之间。
  */
 export interface ChatStreamHandlers {
   /** 增量片段，追加到当前助手气泡末尾 */
   onDelta: (content: string) => void
+  /**
+   * 模型开始调用一个工具，服务端正在执行它。
+   *
+   * 工具执行期间模型不吐字，界面上那几秒的「正在联网搜索…」只有这一个来源。
+   * 载荷是工具名——给用户看的文案由界面自己翻译，后端不管这件事。
+   */
+  onSearch: (tool: string) => void
   /** 生成结束，messageId 是落库后的助手消息 ID */
   onDone: (messageId: number) => void
   /**
@@ -65,6 +73,9 @@ async function streamChat(
         switch (event) {
           case 'delta':
             handlers.onDelta(textField(data, 'content'))
+            break
+          case 'search':
+            handlers.onSearch(textField(data, 'tool'))
             break
           case 'done':
             handlers.onDone(numberField(data, 'messageId'))
