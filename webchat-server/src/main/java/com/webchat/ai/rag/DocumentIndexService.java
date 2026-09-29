@@ -20,6 +20,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -37,10 +38,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 本类只需要「按对象键读出字节」，用 storage 反而更贴合它真正需要的东西。这条边不能改。
  *
  * <p>索引是<b>异步</b>的：上传接口返回时索引多半还没跑完，用户在这期间打字，通常能在点发送之前完成。
- * 万一没跑完，检索会命中 {@link #anyUnavailable} 那条分支，如实告诉模型「文件还在处理中」，
- * 而不是让它凭常识硬答。
+ * 万一没跑完，检索会如实告诉模型「文件还在处理中」，而不是让它凭常识硬答。
  *
- * <p>纯内存，重启即失效——已绑定的附件仍在库里，但向量没了，要重新上传才有检索。
+ * <p>每个附件在 {@link #entries} 里有一格 {@link IndexState}，它是「这个文件的内容现在能不能检索到」
+ * 的唯一依据，同时供三处使用：检索零命中时决定对模型说什么（{@code knowledgeFor}）、
+ * 前端轮询看要不要提示用户（{@code stateOf}）、以及回收时找回自己的片段 id。
+ *
+ * <p>纯内存，重启即失效——已绑定的附件仍在库里，但向量没了，也没有任何记录说它们存在过，
+ * 于是全部落到 {@link IndexState#UNAVAILABLE}，要重新上传才有检索。
  */
 @Slf4j
 @Service
@@ -56,14 +61,23 @@ public class DocumentIndexService {
     private static final String FILE_NAME_KEY = "fileName";
 
     /**
-     * 查询侧的元数据类型标记。
+     * 嵌入侧的元数据类型标记，两侧都要写。
      *
-     * <p>{@code QwenEmbeddingModel} 会读这个键（值是字符串 {@code "query"}）来决定用
-     * {@code TextType.QUERY} 还是 {@code DOCUMENT} 嵌入——非对称检索要用它，否则问题与文档都按
-     * 「文档」嵌入，召回质量会打折。别把这个键挪作他用，它会被模型抢去解释。
+     * <p>{@code QwenEmbeddingModel} 会读这个键来决定用 {@code TextType.QUERY} 还是
+     * {@code DOCUMENT} 嵌入——非对称检索要用它，否则问题与文档都按「文档」嵌入，召回质量会打折。
+     * 别把这个键挪作他用，它会被模型抢去解释。
+     *
+     * <p><b>文档片段也必须带上它</b>，虽然非对称检索只关心查询侧：那个模型在调用之后会按这个键
+     * 排一次序，而 {@code Metadata.getString} 对缺失的键返回 null，{@code Comparator.comparing}
+     * 拿到 null 直接抛 NPE——于是「切出两段以上的文档」全都索引失败，只有单段的小文件能侥幸通过
+     * （一个元素的数组不比较，所以从来没暴露）。值就是 {@code TextType} 的小写名。
      */
     private static final String TYPE_KEY = "type";
     private static final String TYPE_QUERY = "query";
+    private static final String TYPE_DOCUMENT = "document";
+
+    /** 零命中提示里最多逐个列几个文件名，其余的折成一句「另有 N 个」 */
+    private static final int MAX_HINT_FILES = 3;
 
     private final EmbeddingModel embeddingModel;
     private final EmbeddingStore<TextSegment> store;
@@ -73,17 +87,24 @@ public class DocumentIndexService {
     private final Executor executor;
     private final DocumentSplitter splitter;
 
-    /** 附件 id → 它切出来的片段 id。既用于精确回收，存在与否也就是「已索引」的判据 */
-    private final Map<Long, List<String>> segmentsByAttachment = new ConcurrentHashMap<>();
-
-    /** 已提交但还没跑完的附件，用于识别「文件还在处理中」 */
-    private final Set<Long> pending = ConcurrentHashMap.newKeySet();
+    /**
+     * 附件 id → 它这一格的状态：终态、文件名（提示词里要用）、以及切出来的片段 id。
+     *
+     * <p>片段 id 存在终态里而不是单独一张表，是为了让「有状态」与「有片段」不可能脱钩——
+     * 拆成两张表的话，迟早出现「状态说就绪、片段表里却是空的」，而回收正是照着片段 id 删的。
+     *
+     * <p>没有这一格 = 本进程没见过它，即 {@link IndexState#UNAVAILABLE}。三个终态都写在这里，
+     * 「没有记录」于是只剩一种含义，不会再像以前那样把索引失败与重启混为一谈。
+     */
+    private final Map<Long, IndexEntry> entries = new ConcurrentHashMap<>();
 
     /**
      * 索引跑完之前就被删掉的附件。
      *
      * <p>没有它就会漏：{@link #forget} 只能删「已经记下的」片段 id，若附件在索引途中被删，forget
      * 找不到任何东西，而索引线程随后才把片段写进去——这些片段再也没人认领，永久留在库里。
+     * 它也是唯一还需要单独存在的一份状态，因为 {@link #forget} 与索引线程是靠它来<span>争</span>
+     * 那一格的归属（见 {@link #index}）。
      */
     private final Set<Long> forgotten = ConcurrentHashMap.newKeySet();
 
@@ -113,24 +134,42 @@ public class DocumentIndexService {
      *
      * <p>只处理文本附件：图片与视频是 base64 塞进多模态消息的，不进向量库。
      *
+     * <p>空文件在这里就判掉、不进队列——它没有任何可检索的内容，占一个队列位只是白跑一趟，
+     * 而队列是<b>串行</b>的（见 {@code RagConfig}），占位会拖慢排在它后面的文件。
+     *
      * <p>整个方法不抛异常——它是上传成功之后的收尾动作，没有任何理由让一次已经落盘、已经入库的上传
-     * 因为索引挂掉而变成失败。
+     * 因为索引挂掉而变成失败。失败一律记进 {@link #entries}，由前端轮询或下一轮提问去取。
      */
     public void submit(Attachment attachment) {
         if (attachment == null || attachment.getId() == null || !typePolicy.isText(attachment.getMimeType())) {
             return;
         }
         long attachmentId = attachment.getId();
-        // add 是原子的：重复提交同一个附件时只有第一次会往下走
-        if (segmentsByAttachment.containsKey(attachmentId) || !pending.add(attachmentId)) {
+        IndexState initial = isBlankContent(attachment) ? IndexState.EMPTY : IndexState.PENDING;
+        // putIfAbsent 既是去重也是幂等：已经有记录（终态也算）就不再重来一遍，
+        // 否则「索引失败」会在每次提交时重试，而失败件多半是永久失败（文件已被删、内容超限）
+        if (entries.putIfAbsent(attachmentId, IndexEntry.of(initial, attachment)) != null) {
+            return;
+        }
+        if (initial == IndexState.EMPTY) {
+            log.info("附件没有可索引的文本内容（空文件）：id={}, 文件名={}", attachmentId, attachment.getOriginalName());
             return;
         }
         try {
             executor.execute(() -> index(attachment));
         } catch (RuntimeException e) {
-            pending.remove(attachmentId);
-            log.warn("提交文档索引失败：id={}", attachmentId, e);
+            // 队列已满（RagConfig 的拒绝策略抛出来的）。必须就地落一个终态：留在 PENDING 的话，
+            // 这个附件此后每一轮都会对模型说「仍在处理中」，而它永远不会被处理
+            entries.put(attachmentId, IndexEntry.of(IndexState.FAILED, attachment));
+            log.warn("文档索引提交失败（队列已满），该文件不参与检索：id={}, 文件名={}",
+                    attachmentId, attachment.getOriginalName(), e);
         }
+    }
+
+    /** 这个附件此刻的索引状态。没有记录即 {@link IndexState#UNAVAILABLE} */
+    public IndexState stateOf(long attachmentId) {
+        IndexEntry entry = entries.get(attachmentId);
+        return entry == null ? IndexState.UNAVAILABLE : entry.state();
     }
 
     /**
@@ -141,11 +180,11 @@ public class DocumentIndexService {
      */
     public void forget(long attachmentId) {
         forgotten.add(attachmentId);
-        List<String> segmentIds = segmentsByAttachment.remove(attachmentId);
-        if (segmentIds != null) {
-            store.removeAll(segmentIds);
-            release(segmentIds.size());
-            log.debug("已回收附件向量：id={}, 片段数={}", attachmentId, segmentIds.size());
+        IndexEntry removed = entries.remove(attachmentId);
+        if (removed != null && !removed.segmentIds().isEmpty()) {
+            store.removeAll(removed.segmentIds());
+            release(removed.segmentIds().size());
+            log.debug("已回收附件向量：id={}, 片段数={}", attachmentId, removed.segmentIds().size());
         }
     }
 
@@ -175,15 +214,60 @@ public class DocumentIndexService {
             log.debug("检索命中 {} 个片段，候选附件 {} 个", segments.size(), attachmentIds.size());
             return format(segments);
         }
-        // 有文档却零命中。两种可能：确实不相关，或者文件还排在索引队列里（上传后立刻提问必然如此）。
+        // 有文档却零命中。可能是确实不相关，也可能是文件还排在索引队列里／索引失败／内容已随重启丢失。
         // 什么都不说的话，模型会凭常识硬答，用户没法分辨它到底读没读文件
-        return anyUnavailable(attachmentIds) ? Prompt.KNOWLEDGE_PENDING_HINT : Prompt.KNOWLEDGE_EMPTY_HINT;
+        return unavailableHint(attachmentIds);
     }
 
-    /** 这批附件里有没有还不能检索的（仍在索引中，或压根没索引成功） */
-    public boolean anyUnavailable(Collection<Long> attachmentIds) {
-        return attachmentIds.stream()
-                .anyMatch(id -> pending.contains(id) || !segmentsByAttachment.containsKey(id));
+    /**
+     * 零命中时按<b>每个附件自己的状态</b>说明原因。
+     *
+     * <p>这里原先是「这批附件里有没有没索引好的」三选一的一整句，而那个判据把索引失败、空文件、
+     * 重启后向量清空全部算了进去——于是一次重启之后，每个带过文本附件的会话都会对模型说
+     * 「文件仍在处理中」，而它永远不会变成可检索。现在只有真的在排队才那么说。
+     */
+    private String unavailableHint(List<Long> attachmentIds) {
+        boolean pending = false;
+        boolean lost = false;
+        List<String> files = new ArrayList<>();
+        for (Long attachmentId : attachmentIds) {
+            IndexEntry entry = entries.get(attachmentId);
+            if (entry == null) {
+                // 本进程没有它的记录 = 上传发生在上一次启动，向量已随重启清空
+                lost = true;
+                continue;
+            }
+            switch (entry.state()) {
+                case PENDING -> pending = true;
+                case EMPTY -> files.add(Prompt.KNOWLEDGE_EMPTY_FILE_HINT.formatted(entry.fileName()));
+                case FAILED -> files.add(Prompt.KNOWLEDGE_FAILED_FILE_HINT.formatted(entry.fileName()));
+                // READY 却零命中就是「不相关」，没有额外要说的；
+                // NOT_INDEXED 不会走到这里——检索范围里只有文本附件
+                default -> {
+                }
+            }
+        }
+        List<String> parts = new ArrayList<>(3);
+        if (pending) {
+            parts.add(Prompt.KNOWLEDGE_PENDING_HINT);
+        }
+        if (lost) {
+            parts.add(Prompt.KNOWLEDGE_LOST_HINT);
+        }
+        if (!files.isEmpty()) {
+            parts.add(joinedFiles(files));
+        }
+        // 全都就绪却零命中：确实不相关，而不是「还没有」
+        return parts.isEmpty() ? Prompt.KNOWLEDGE_EMPTY_HINT : String.join("", parts);
+    }
+
+    /** 文件一多，逐个列名字会把提示词越撑越长；列前几个再报一个总数，够模型判断了 */
+    private static String joinedFiles(List<String> notes) {
+        if (notes.size() <= MAX_HINT_FILES) {
+            return String.join("", notes);
+        }
+        return String.join("", notes.subList(0, MAX_HINT_FILES))
+                + Prompt.KNOWLEDGE_MORE_FILES_HINT.formatted(notes.size() - MAX_HINT_FILES);
     }
 
     private List<TextSegment> retrieve(String query, List<Long> attachmentIds) {
@@ -220,6 +304,12 @@ public class DocumentIndexService {
         return kept;
     }
 
+    /**
+     * 索引一个附件，跑在索引线程池上。
+     *
+     * <p>四条失败路径（切分后为空、片段过多、向量库预算耗尽、embedding 或存储抛异常）都要落一个
+     * <b>终态</b>。停在 PENDING 就等于对模型说「再等等」，而等待不会有结果。
+     */
     private void index(Attachment attachment) {
         long attachmentId = attachment.getId();
         int reserved = 0;
@@ -231,33 +321,75 @@ public class DocumentIndexService {
             }
             List<TextSegment> segments = split(attachment);
             if (segments.isEmpty()) {
+                // submit 时已经按「解码后是否全空白」挡过一道，这里是兜底：切分器的过滤条件
+                // （丢掉全空白的片段）与那个判据毕竟不是同一段代码
+                mark(attachmentId, IndexState.EMPTY, attachment);
                 log.info("附件没有可索引的文本内容：id={}, 文件名={}", attachmentId, attachment.getOriginalName());
+                return;
+            }
+            int perDocumentLimit = properties.maxSegmentsPerDocument();
+            if (segments.size() > perDocumentLimit) {
+                mark(attachmentId, IndexState.FAILED, attachment);
+                log.warn("附件切分出的片段过多（{} 段，单文件上限 {}），不索引：id={}, 文件名={}",
+                        segments.size(), perDocumentLimit, attachmentId, attachment.getOriginalName());
                 return;
             }
             reserved = reserve(segments.size());
             if (reserved == 0) {
+                mark(attachmentId, IndexState.FAILED, attachment);
+                log.warn("向量库片段总数已达上限 {}，本次不索引（重启或删除附件后恢复）：id={}, 文件名={}, 需要 {} 段",
+                        properties.maxTotalSegments(), attachmentId, attachment.getOriginalName(), segments.size());
                 return;
             }
             // QwenEmbeddingModel 内部已按 10 条一批自己切分，这里不必再分
             List<Embedding> embeddings = embeddingModel.embedAll(segments).content();
             List<String> segmentIds = store.addAll(embeddings, segments);
-            if (forgotten.contains(attachmentId)) {
-                // 索引跑的这段时间里附件被删了。刚写进去的片段必须自己撤掉，否则永久泄漏
+            // 与 forget 争这一格：两边都走 map 的同一个 key，谁先谁后由它定序，谁都不会漏删或多删
+            IndexEntry settled = entries.compute(attachmentId, (key, current) ->
+                    forgotten.contains(key) ? null : IndexEntry.ready(attachment, segmentIds));
+            if (settled == null) {
+                // 索引跑的这段时间里附件被删了。刚写进去的片段必须自己撤掉，否则永久泄漏。
+                // 配额不能在这里释放：kept 仍是 false，由 finally 统一释放
                 store.removeAll(segmentIds);
                 log.debug("附件在索引途中被删除，已撤回片段：id={}, 片段数={}", attachmentId, segmentIds.size());
                 return;
             }
-            segmentsByAttachment.put(attachmentId, segmentIds);
             kept = true;
             log.info("已索引附件：id={}, 文件名={}, 片段数={}", attachmentId, attachment.getOriginalName(), segmentIds.size());
         } catch (Exception e) {
+            mark(attachmentId, IndexState.FAILED, attachment);
             log.warn("索引附件失败，该文件本轮不参与检索：id={}, 文件名={}",
                     attachmentId, attachment.getOriginalName(), e);
         } finally {
             if (reserved > 0 && !kept) {
                 release(reserved);
             }
-            pending.remove(attachmentId);
+            // 期间被删掉的话不留记录：它已经不存在了，任何状态都只会误导
+            if (forgotten.contains(attachmentId)) {
+                entries.remove(attachmentId);
+            }
+        }
+    }
+
+    /** 落一个终态。期间被删则不留记录（与 {@link #index} 的收尾同一个判据） */
+    private void mark(long attachmentId, IndexState state, Attachment attachment) {
+        entries.compute(attachmentId, (key, current) ->
+                forgotten.contains(key) ? null : IndexEntry.of(state, attachment));
+    }
+
+    /**
+     * 上传后、入队前的空文件预检。
+     *
+     * <p>读不出来或解不开一律当作「不是空文件」，交给索引线程去报错——那里有一条完整的失败记录
+     * 与堆栈，而这里只是个省一次排队的优化，不该抢它的活。
+     */
+    private boolean isBlankContent(Attachment attachment) {
+        try {
+            return PlainTextDecoder.decode(storage.read(attachment.getObjectKey()))
+                    .map(String::isBlank)
+                    .orElse(false);
+        } catch (RuntimeException e) {
+            return false;
         }
     }
 
@@ -269,7 +401,9 @@ public class DocumentIndexService {
                 .orElseThrow(() -> new IllegalStateException("附件内容已不是可解码的文本：" + attachment.getObjectKey()));
         Metadata metadata = Metadata.from(Map.of(
                 ATTACHMENT_ID_KEY, attachment.getId(),
-                FILE_NAME_KEY, attachment.getOriginalName()));
+                FILE_NAME_KEY, attachment.getOriginalName(),
+                // 不能省：少这个键时「切出两段以上」的文档会在 embedding 那一步抛 NPE（见 TYPE_KEY）
+                TYPE_KEY, TYPE_DOCUMENT));
         // 切分器按「段落 → 行 → 句子 → 词 → 字符」逐级下探，最后一级是逐字符切，
         // 所以没有换行的超长单行也会被切到 chunkSize 以内，不会产生巨型片段
         return splitter.split(Document.from(text, metadata)).stream()
@@ -287,7 +421,6 @@ public class DocumentIndexService {
         while (true) {
             int current = totalSegments.get();
             if (current + segments > limit) {
-                log.warn("向量库已达上限 {} 段，本次不再索引（重启或删除附件后恢复）", limit);
                 return 0;
             }
             if (totalSegments.compareAndSet(current, current + segments)) {
@@ -309,5 +442,17 @@ public class DocumentIndexService {
                     .append(segment.text()).append("\n\n");
         }
         return Prompt.KNOWLEDGE_PROMPT_TEMPLATE.formatted(block.toString().strip());
+    }
+
+    /** 一个附件的那一格：状态、文件名（提示词要用）、以及可检索的片段 id（就绪时才有） */
+    private record IndexEntry(IndexState state, String fileName, List<String> segmentIds) {
+
+        static IndexEntry of(IndexState state, Attachment attachment) {
+            return new IndexEntry(state, attachment.getOriginalName(), List.of());
+        }
+
+        static IndexEntry ready(Attachment attachment, List<String> segmentIds) {
+            return new IndexEntry(IndexState.READY, attachment.getOriginalName(), List.copyOf(segmentIds));
+        }
     }
 }

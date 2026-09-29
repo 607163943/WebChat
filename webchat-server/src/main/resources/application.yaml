@@ -27,7 +27,11 @@ langchain4j:
   community:
     dashscope:
       embedding-model:
-        model-name: qwen3.7-text-embedding-flash
+        # 模型名不能随手换：QwenEmbeddingModel 调用后会按返回项的 text_index 排序，而 SDK 只认这个
+        # 字段名。qwen3.7-text-embedding-flash 返回的是 index，取到 null 会让 Comparator.comparing
+        # 抛 NPE——表现是「切出两段以上的文档全都索引失败」，单段小文件却没事，很难往这里想。
+        # v4 在同一个端点上返回的正是 text_index，实测 1MB / 874 段可正常索引
+        model-name: text-embedding-v4
         api-key: ${CHAT_MODEL_API_KEY}
       chat-model:
         api-key: ${CHAT_MODEL_API_KEY}
@@ -70,7 +74,12 @@ webchat:
     min-score: 0.7
     chunk-size: 1200
     chunk-overlap: 200
-    # 整个向量库的片段总数上限，约合 60MB 堆。超过后新文档不再索引，只记一条 warn
+    # 单个文档的片段数上限，对上「你这个文件太大」这个归因。按当前参数它还够不到：切分步长
+    # 实测是 chunk-size 本身，1MB 纯 ASCII 约 874 段、中文约 350 段。它挡的是日后放宽文本大小
+    # 上限或调小 chunk-size 之后的情况——没有它，一个超大文件能一口气吃掉全库预算
+    max-segments-per-document: 1000
+    # 整个向量库的片段总数上限，约合 60MB 堆。超过后新文档不再索引，只记一条 warn。
+    # 注意它与上面那条是两回事：撞上它说明库已被别的文件占满，与当前这个文件大不大无关
     max-total-segments: 10000
     # 检索在回复的关键路径上，而 SSE 没有心跳事件，超时就当作没检索到
     retrieval-timeout: 3s

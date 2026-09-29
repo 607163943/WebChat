@@ -8,8 +8,27 @@ import type { components } from './schema'
  */
 export type Conversation = Required<components['schemas']['ConversationVO']>
 
+/**
+ * 文本附件的向量索引状态。
+ *
+ * `pending` 之后必然走到一个终态，所以它既是界面上「还要不要继续问」的判据，
+ * 也是轮询的终止条件。后端只把结果放在这里，失败原因（片段过多、队列已满、向量库满、
+ * embedding 异常）只写日志——它们对用户是同一件事，分了也没有可采取的动作。
+ */
+export type IndexState = 'pending' | 'ready' | 'empty' | 'failed' | 'unavailable' | 'not_indexed'
+
 /** 一个已上传的附件。上传响应与消息回显共用同一个结构 */
-export type Attachment = Required<components['schemas']['AttachmentVO']>
+export type Attachment = Omit<Required<components['schemas']['AttachmentVO']>, 'indexState'> & {
+  indexState: IndexState
+}
+
+/** 附件的索引状态，轮询接口的最小投影 */
+export type AttachmentIndexState = Omit<
+  Required<components['schemas']['AttachmentIndexStateVO']>,
+  'indexState'
+> & {
+  indexState: IndexState
+}
 
 /**
  * 一条助手回复是怎么收场的。

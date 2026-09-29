@@ -2,9 +2,11 @@ package com.webchat.service;
 
 import com.baomidou.mybatisplus.core.conditions.Wrapper;
 import com.webchat.ai.rag.DocumentIndexService;
+import com.webchat.ai.rag.IndexState;
 import com.webchat.common.BizException;
 import com.webchat.config.AttachmentProperties;
 import com.webchat.config.CurrentUserProvider;
+import com.webchat.dto.AttachmentIndexStateVO;
 import com.webchat.dto.AttachmentVO;
 import com.webchat.entity.Attachment;
 import com.webchat.mapper.AttachmentMapper;
@@ -27,8 +29,10 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -99,6 +103,10 @@ class AttachmentServiceTests {
         assertThat(row.getUserId()).isEqualTo(USER_ID);
         assertThat(row.getRetryCount()).isZero();
         assertThat(vo.originalName()).isEqualTo("照片.png");
+        // 图片不进向量库，单独给一个 not_indexed：它不该被读成「重启后失效」，
+        // 否则前端会一直轮询一个永远不会有变化的状态
+        assertThat(vo.indexState()).isEqualTo("not_indexed");
+        verify(documentIndexService, never()).stateOf(anyLong());
     }
 
     @Test
@@ -161,12 +169,50 @@ class AttachmentServiceTests {
     @DisplayName("上传成功后就提交向量化索引；媒体也照提交，类型过滤在索引服务里做")
     void submitsUploadedAttachmentForIndexing() {
         when(currentUserProvider.userId()).thenReturn(USER_ID);
+        // 真实的自增列会把 id 回填到实体上（IdType.AUTO），mock 掉之后要自己补，
+        // 否则上传响应里的索引状态无从查起
+        doAnswer(invocation -> {
+            invocation.getArgument(0, Attachment.class).setId(100L);
+            return 1;
+        }).when(attachmentMapper).insert(any(Attachment.class));
+        when(documentIndexService.stateOf(100L)).thenReturn(IndexState.READY);
 
-        service.upload(null, "纪要.txt", "text/plain", "会议纪要正文".getBytes(StandardCharsets.UTF_8));
+        AttachmentVO vo = service.upload(null, "纪要.txt", "text/plain",
+                "会议纪要正文".getBytes(StandardCharsets.UTF_8));
 
         ArgumentCaptor<Attachment> captor = ArgumentCaptor.forClass(Attachment.class);
         verify(documentIndexService).submit(captor.capture());
         assertThat(captor.getValue().getMimeType()).isEqualTo("text/plain");
+        // 文本附件的状态取自索引服务：上传响应里带的只能是「刚提交」那一刻的值
+        assertThat(vo.indexState()).isEqualTo("ready");
+    }
+
+    @Test
+    @DisplayName("查询索引状态：只回真实存在的 id，媒体不进索引服务（它压根不参与索引）")
+    void listsIndexStates() {
+        when(currentUserProvider.userId()).thenReturn(USER_ID);
+        Attachment text = existing(100L, 9L);
+        text.setMimeType("text/plain");
+        Attachment image = existing(101L, 9L);
+        image.setMimeType("image/png");
+        // 999L 查不到（已清理或不属于当前用户），结果里就不该有它
+        when(attachmentMapper.selectExisting(any(), eq(USER_ID))).thenReturn(List.of(text, image));
+        when(documentIndexService.stateOf(100L)).thenReturn(IndexState.PENDING);
+
+        assertThat(service.indexStates(List.of(100L, 101L, 999L)))
+                .containsExactly(new AttachmentIndexStateVO(100L, "pending"),
+                        new AttachmentIndexStateVO(101L, "not_indexed"));
+
+        verify(documentIndexService, never()).stateOf(101L);
+    }
+
+    @Test
+    @DisplayName("查询索引状态：没有 id 就不发查询")
+    void skipsIndexStatesWithoutIds() {
+        assertThat(service.indexStates(List.of())).isEmpty();
+        assertThat(service.indexStates(null)).isEmpty();
+
+        verify(attachmentMapper, never()).selectExisting(any(), anyLong());
     }
 
     @Test

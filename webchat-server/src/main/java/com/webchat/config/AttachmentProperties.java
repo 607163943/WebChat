@@ -26,8 +26,9 @@ public record AttachmentProperties(
          * 单个<b>文本</b>文件的大小上限，比媒体严得多。
          *
          * <p>文本要切分后逐段调 embedding，成本随体量线性上升：1MB 中文约 35 万 token，而
-         * {@code qwen3.7-text-embedding-flash} 的 TPM 是 100 万——一个满额的文件就吃掉三分之一的
-         * 每分钟配额，再同时传几个就会撞限流。10MB 的文本则要几百次调用、索引期间该文件一直不可检索。
+         * {@code text-embedding-v4} 的 TPM 是 100 万（官方配额 RPM 1K / TPM 1M）——一个满额的文件
+         * 就吃掉三分之一的每分钟配额，再同时传几个就会撞限流。10MB 的文本则要几百次调用、
+         * 索引期间该文件一直不可检索。
          */
         @DefaultValue("1MB") DataSize maxTextFileSize,
 

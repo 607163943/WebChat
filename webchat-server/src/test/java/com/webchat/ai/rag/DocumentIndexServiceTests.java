@@ -27,6 +27,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -72,7 +73,12 @@ class DocumentIndexServiceTests {
     }
 
     private static RagProperties defaultProperties() {
-        return new RagProperties(5, 0.7, 1200, 200, 10000, Duration.ofSeconds(3));
+        return new RagProperties(5, 0.7, 1200, 200, 1000, 10000, Duration.ofSeconds(3));
+    }
+
+    /** 单文件片段上限压到 1 段，好让一份普通正文就能撞上「片段过多」 */
+    private static RagProperties tinyDocumentProperties() {
+        return new RagProperties(5, 0.7, 1200, 200, 1, 10000, Duration.ofSeconds(3));
     }
 
     private DocumentIndexService serviceWith(RagProperties properties, Executor executor) {
@@ -121,6 +127,10 @@ class DocumentIndexServiceTests {
         Metadata metadata = captor.getValue().get(0).metadata();
         assertThat(metadata.getLong("attachmentId")).isEqualTo(ATTACHMENT_ID);
         assertThat(metadata.getString("fileName")).isEqualTo("纪要-100.txt");
+        // 这一条不是「顺手也带上」：QwenEmbeddingModel 会按它排序，缺失时 getString 返回 null，
+        // Comparator.comparing 直接抛 NPE——表现是「切出两段以上的文档全都索引失败」。
+        // 单段文件不比较数组，所以只在多段文档上暴露
+        assertThat(metadata.getString("type")).isEqualTo("document");
     }
 
     @Test
@@ -141,7 +151,8 @@ class DocumentIndexServiceTests {
         service.submit(attachment(ATTACHMENT_ID, "text/plain"));
         service.submit(attachment(ATTACHMENT_ID, "text/plain"));
 
-        verify(storage).read(any());
+        // 用「调了几次 embedding」当判据，而不是读了几次文件：文件在入库前的空文件预检里还会读一次
+        verify(embeddingModel).embedAll(anyList());
     }
 
     @Test
@@ -157,21 +168,40 @@ class DocumentIndexServiceTests {
     }
 
     @Test
-    @DisplayName("内容全是空白就不写库，也不调 embedding")
+    @DisplayName("空文件在入队前就判掉：不写库、不调 embedding，也不占队列")
     void skipsBlankContent() {
         storageReturns("   \n\n  ");
+        List<Runnable> queue = new ArrayList<>();
+        DocumentIndexService deferring = serviceWith(defaultProperties(), queue::add);
 
-        service.submit(attachment(ATTACHMENT_ID, "text/plain"));
+        deferring.submit(attachment(ATTACHMENT_ID, "text/plain"));
 
         verifyNoInteractions(embeddingModel);
         verify(store, never()).addAll(anyList(), anyList());
+        // 队列一个任务都没收到：空文件不进 RAG，而不是进了队列再被丢掉
+        assertThat(queue).isEmpty();
+        assertThat(deferring.stateOf(ATTACHMENT_ID)).isEqualTo(IndexState.EMPTY);
     }
 
     @Test
-    @DisplayName("向量库到上限后不再索引新文档，只记一条 warn")
+    @DisplayName("单个文档的片段数超过上限：记索引失败，连 embedding 都不调（归因是「这个文件太大」）")
+    void rejectsDocumentWithTooManySegments() {
+        // 上限压到 1 段，再给一份必然切出多段的正文：切分步长是 chunkSize - chunkOverlap = 1000 字符，
+        // 所以 2500 个字符切出来不止一段。判据与「向量库总预算」是两条独立的线
+        DocumentIndexService strict = serviceWith(tinyDocumentProperties(), Runnable::run);
+        storageReturns("a".repeat(2500));
+
+        strict.submit(attachment(ATTACHMENT_ID, "text/plain"));
+
+        verifyNoInteractions(embeddingModel);
+        assertThat(strict.stateOf(ATTACHMENT_ID)).isEqualTo(IndexState.FAILED);
+    }
+
+    @Test
+    @DisplayName("向量库总预算耗尽：同样记失败，但这不是「文件太大」——日志里分得清")
     void stopsIndexingOnceStoreIsFull() {
         DocumentIndexService tiny = serviceWith(
-                new RagProperties(5, 0.7, 1200, 200, 1, Duration.ofSeconds(3)), Runnable::run);
+                new RagProperties(5, 0.7, 1200, 200, 1000, 1, Duration.ofSeconds(3)), Runnable::run);
         storageReturns("正文");
         modelReturnsOneEmbeddingPerSegment();
         when(store.addAll(anyList(), anyList())).thenReturn(List.of("seg-1"));
@@ -181,6 +211,37 @@ class DocumentIndexServiceTests {
 
         // 第一份占满了那 1 个名额，第二份连 embedding 都不该调
         verify(embeddingModel).embedAll(anyList());
+        assertThat(tiny.stateOf(ATTACHMENT_ID)).isEqualTo(IndexState.READY);
+        assertThat(tiny.stateOf(101L)).isEqualTo(IndexState.FAILED);
+    }
+
+    @Test
+    @DisplayName("索引队列已满：落一个终态，不能留在「处理中」——它永远不会被处理")
+    void marksFailedWhenQueueIsFull() {
+        Executor rejecting = task -> {
+            throw new RejectedExecutionException("文档索引队列已满");
+        };
+        DocumentIndexService busy = serviceWith(defaultProperties(), rejecting);
+        storageReturns("正文");
+
+        busy.submit(attachment(ATTACHMENT_ID, "text/plain"));
+
+        assertThat(busy.stateOf(ATTACHMENT_ID)).isEqualTo(IndexState.FAILED);
+        verifyNoInteractions(embeddingModel);
+    }
+
+    @Test
+    @DisplayName("本进程没有记录的附件是「已不可用」，不是「还在处理中」")
+    void reportsUnavailableForAttachmentsFromPreviousRun() {
+        storageReturns("正文");
+        modelReturnsOneEmbeddingPerSegment();
+        when(store.addAll(anyList(), anyList())).thenReturn(List.of("seg-1"));
+        service.submit(attachment(ATTACHMENT_ID, "text/plain"));
+
+        // 换一个服务实例，等价于进程重启：向量库与状态都空了
+        DocumentIndexService restarted = serviceWith(defaultProperties(), Runnable::run);
+
+        assertThat(restarted.stateOf(ATTACHMENT_ID)).isEqualTo(IndexState.UNAVAILABLE);
     }
 
     // ---------------------------------------------------------------- 回收
@@ -219,12 +280,16 @@ class DocumentIndexServiceTests {
     @DisplayName("排队期间就被删掉：连 embedding 都不必白跑一次")
     void skipsIndexingWhenDeletedBeforeItStarts() {
         service = serviceWith(defaultProperties(), queued::add);
+        storageReturns("正文");
         service.forget(ATTACHMENT_ID);
 
         service.submit(attachment(ATTACHMENT_ID, "text/plain"));
         queued.forEach(Runnable::run);
 
-        verifyNoInteractions(embeddingModel, storage);
+        // 入库前的空文件预检还是会读一次文件（它只解码、不碰 embedding），所以 storage 不算零交互
+        verifyNoInteractions(embeddingModel);
+        verify(store, never()).addAll(anyList(), anyList());
+        assertThat(service.stateOf(ATTACHMENT_ID)).isEqualTo(IndexState.UNAVAILABLE);
     }
 
     // ---------------------------------------------------------------- 检索
@@ -295,6 +360,7 @@ class DocumentIndexServiceTests {
     @DisplayName("零命中且文件还排在索引队列里：明说在处理中，用户才知道稍后再问")
     void reportsPendingWhenDocumentsAreStillBeingIndexed() {
         DocumentIndexService deferring = serviceWith(defaultProperties(), queued::add);
+        storageReturns("正文");
         deferring.submit(attachment(ATTACHMENT_ID, "text/plain"));
         when(embeddingModel.embed(any(TextSegment.class))).thenReturn(Response.from(embedding()));
         when(store.search(any(EmbeddingSearchRequest.class)))
@@ -302,5 +368,52 @@ class DocumentIndexServiceTests {
 
         assertThat(deferring.knowledgeFor("讲了什么", List.of(ATTACHMENT_ID)))
                 .isEqualTo(Prompt.KNOWLEDGE_PENDING_HINT);
+    }
+
+    @Test
+    @DisplayName("零命中且文件是空的：说清「是空的」，别让模型以为只是没匹配上")
+    void reportsEmptyFile() {
+        storageReturns("   \n\n  ");
+        service.submit(attachment(ATTACHMENT_ID, "text/plain"));
+        when(embeddingModel.embed(any(TextSegment.class))).thenReturn(Response.from(embedding()));
+        when(store.search(any(EmbeddingSearchRequest.class)))
+                .thenReturn(new EmbeddingSearchResult<>(List.of()));
+
+        assertThat(service.knowledgeFor("讲了什么", List.of(ATTACHMENT_ID)))
+                .isEqualTo(Prompt.KNOWLEDGE_EMPTY_FILE_HINT.formatted("纪要-100.txt"));
+    }
+
+    @Test
+    @DisplayName("零命中且文件处理失败：说内容不可用。正常路径上走不到（失败的附件会被前端撤下）")
+    void reportsFailedFile() {
+        storageReturns("正文");
+        when(embeddingModel.embedAll(anyList())).thenThrow(new RuntimeException("embedding 服务不可用"));
+        service.submit(attachment(ATTACHMENT_ID, "text/plain"));
+        assertThat(service.stateOf(ATTACHMENT_ID)).isEqualTo(IndexState.FAILED);
+
+        when(embeddingModel.embed(any(TextSegment.class))).thenReturn(Response.from(embedding()));
+        when(store.search(any(EmbeddingSearchRequest.class)))
+                .thenReturn(new EmbeddingSearchResult<>(List.of()));
+
+        assertThat(service.knowledgeFor("讲了什么", List.of(ATTACHMENT_ID)))
+                .isEqualTo(Prompt.KNOWLEDGE_FAILED_FILE_HINT.formatted("纪要-100.txt"));
+    }
+
+    @Test
+    @DisplayName("重启后零命中：如实说内容已不可用，不是「仍在处理中」——后者会让用户一直等下去")
+    void reportsLostAfterRestart() {
+        storageReturns("正文");
+        modelReturnsOneEmbeddingPerSegment();
+        when(store.addAll(anyList(), anyList())).thenReturn(List.of("seg-1"));
+        service.submit(attachment(ATTACHMENT_ID, "text/plain"));
+
+        // 换一个服务实例，等价于进程重启：向量库与状态一起清空，而会话里的附件 id 还在
+        DocumentIndexService restarted = serviceWith(defaultProperties(), Runnable::run);
+        when(embeddingModel.embed(any(TextSegment.class))).thenReturn(Response.from(embedding()));
+        when(store.search(any(EmbeddingSearchRequest.class)))
+                .thenReturn(new EmbeddingSearchResult<>(List.of()));
+
+        assertThat(restarted.knowledgeFor("讲了什么", List.of(ATTACHMENT_ID)))
+                .isEqualTo(Prompt.KNOWLEDGE_LOST_HINT);
     }
 }

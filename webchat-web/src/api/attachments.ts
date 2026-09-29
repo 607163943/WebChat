@@ -1,5 +1,5 @@
-import { API_BASE_URL, del, upload } from './http'
-import type { Attachment } from './types'
+import { API_BASE_URL, del, get, upload } from './http'
+import type { Attachment, AttachmentIndexState } from './types'
 
 /**
  * 上传一个附件，返回可直接回显的附件对象。
@@ -26,6 +26,19 @@ export function uploadAttachment(
 /** 删除一个还没随消息发出的附件。后端幂等，重复删除不报错 */
 export function deleteAttachment(id: number): Promise<void> {
   return del<void>(`/api/attachments/${id}`)
+}
+
+/**
+ * 批量查询附件的索引状态。
+ *
+ * 文本附件的向量化在后台跑，上传响应里带的只能是「刚提交」那一刻的状态，
+ * 失败（embedding 挂了、片段过多、队列满）要过一会儿才知道——靠这个接口问出来。
+ *
+ * ids 用逗号分隔：Spring 的 List<Long> 参数按这个约定拆分。
+ */
+export function fetchIndexStates(ids: number[]): Promise<AttachmentIndexState[]> {
+  const query = new URLSearchParams({ ids: ids.join(',') })
+  return get<AttachmentIndexState[]>(`/api/attachments/index-state?${query}`)
 }
 
 /**

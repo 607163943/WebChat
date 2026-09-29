@@ -1,5 +1,6 @@
 package com.webchat.service;
 
+import com.webchat.dto.AttachmentIndexStateVO;
 import com.webchat.dto.AttachmentVO;
 import com.webchat.entity.Attachment;
 
@@ -51,6 +52,13 @@ public interface AttachmentService {
 
     /** 取某一条消息的附件。重新生成时按尾部用户消息取回 */
     List<Attachment> findByMessageId(Long messageId);
+
+    /**
+     * 批量取附件的索引状态，供前端在附件到达终态之前轮询。
+     *
+     * <p>只返回<b>属于当前用户且真实存在</b>的 id：轮询接口不该变成一个 id 探测器。
+     */
+    List<AttachmentIndexStateVO> indexStates(List<Long> ids);
 
     /**
      * 取某会话内全部<b>文本</b>附件的 id，即将被检索的那批。

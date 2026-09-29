@@ -82,6 +82,24 @@ public interface AttachmentMapper extends BaseMapper<Attachment> {
     int increaseRetryCount(@Param("id") Long id);
 
     /**
+     * 一批附件的 id 与类型，供查询索引状态用。
+     *
+     * <p>只取这两列：状态本身在内存里（见 {@code DocumentIndexService}），这里只是用它把 id 收窄成
+     * 「属于当前用户、且真实存在」的那批——轮询接口不该变成一个 id 探测器。
+     *
+     * <p>与 {@link #selectBindable} 一样，{@code IN} 必须用 {@code <foreach>}。
+     */
+    @Select("""
+            <script>
+            SELECT id, mime_type FROM tb_attachment
+            WHERE user_id = #{userId}
+              AND id IN
+              <foreach collection="ids" item="id" open="(" separator="," close=")">#{id}</foreach>
+            </script>
+            """)
+    List<Attachment> selectExisting(@Param("ids") List<Long> ids, @Param("userId") long userId);
+
+    /**
      * 某会话内全部文本附件的 id，供文档检索按它过滤向量库。
      *
      * <p>只按顶层类型取 {@code text/}：图片与视频是 base64 塞进多模态消息的，压根不在向量库里，

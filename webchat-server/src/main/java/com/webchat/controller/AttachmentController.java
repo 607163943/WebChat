@@ -3,6 +3,7 @@ package com.webchat.controller;
 import com.webchat.common.BizException;
 import com.webchat.common.Result;
 import com.webchat.common.ResultCode;
+import com.webchat.dto.AttachmentIndexStateVO;
 import com.webchat.dto.AttachmentVO;
 import com.webchat.entity.Attachment;
 import com.webchat.service.AttachmentService;
@@ -24,6 +25,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 @Tag(name = "附件")
@@ -38,12 +40,25 @@ public class AttachmentController {
             图片、MP4 视频或 txt 文本文件，单文件上限与允许的类型见 webchat.attachment 配置与 AttachmentTypePolicy。
             上传即落库并返回可回显的 url，此时 message_id 为空（待绑定），随发送消息时提交 id 完成绑定。
             conversationId 可选：新对话草稿态还没有会话，留空即可。
-            文本文件会异步切分并向量化，供提问时检索；索引状态不落库，前端也不展示。""")
+            文本文件会异步切分并向量化，供提问时检索；返回的 indexState 说明此刻的索引状态，
+            它随上传响应只能给出「刚提交」那一刻的值，异步失败要靠 /index-state 轮询才知道。""")
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public Result<AttachmentVO> upload(@RequestPart("file") MultipartFile file,
                                        @RequestParam(value = "conversationId", required = false) Long conversationId) {
         return Result.ok(attachmentService.upload(conversationId, file.getOriginalFilename(),
                 file.getContentType(), bytesOf(file)));
+    }
+
+    @Operation(summary = "查询附件的索引状态", description = """
+            批量查询文本附件的向量索引状态，供前端在附件到达终态之前轮询。
+            取值：pending 排队或索引中、ready 可检索、empty 空文件（不进 RAG）、
+            failed 处理失败（不会自愈，前端应提示用户并撤下这个附件）、
+            unavailable 本进程没有它的记录（上传发生在上一次启动，向量已随重启清空）、
+            not_indexed 图片或视频（不进向量库）。
+            只返回属于当前用户、且真实存在的 id，查询接口不做 id 探测器。""")
+    @GetMapping("/index-state")
+    public Result<List<AttachmentIndexStateVO>> indexStates(@RequestParam("ids") List<Long> ids) {
+        return Result.ok(attachmentService.indexStates(ids));
     }
 
     @Operation(summary = "读取附件内容", description = """

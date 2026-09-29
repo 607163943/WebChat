@@ -9,6 +9,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
+import java.util.concurrent.RejectedExecutionException;
+
 /**
  * 文档检索的装配。
  *
@@ -38,7 +40,8 @@ public class RagConfig {
     /**
      * 索引文档专用的线程池。
      *
-     * <p>核心与最大都设 1 是<b>有意串行</b>：embedding 接口有 TPM 限额（该模型每分钟 100 万 token），
+     * <p>核心与最大都设 1 是<b>有意串行</b>：embedding 接口有额度限制（`text-embedding-v4` 官方配额
+     * RPM 1K / TPM 1M，按模型内部的 10 条一批算，一份 1MB 文本是 88 次调用、约 35 万 token），
      * 并发索引几个大文件很容易撞限流，而限流会让整批索引失败。排队慢一点，但结果可预期。
      *
      * <p>注意这个 bean 的名字会被 {@link DocumentIndexService} 用 {@code @Qualifier} 点名注入：
@@ -51,12 +54,18 @@ public class RagConfig {
         executor.setMaxPoolSize(1);
         executor.setQueueCapacity(50);
         executor.setThreadNamePrefix("document-index-");
-        // 拒绝策略必须是「丢弃并记日志」这一种：
+        // 拒绝策略必须让<b>提交方知道</b>被拒了：
         // CallerRunsPolicy 会把任务退回调用线程执行，也就是堵住上传请求，正好违背异步的初衷；
-        // AbortPolicy 会让 RejectedExecutionException 冒进 upload()，把一次已经成功的上传变成 500。
-        executor.setRejectedExecutionHandler((task, pool) -> log.warn(
-                "文档索引队列已满，本次不再索引：activeCount={}, queueSize={}",
-                pool.getActiveCount(), pool.getQueue().size()));
+        // 而「丢弃 + 只记日志」会让 DocumentIndexService 的 pending 永远留在那里——提交方以为
+        // 排上队了，此后每一轮提问都对模型说「文件仍在处理中」，而它永远不会被处理。
+        // 抛出异常由 submit 捕获，这个附件就地记成索引失败，前端据此提示用户重传。
+        // 注意异常的出口只有 submit 一处（upload 里那行后面没有别的动作），
+        // 所以它不会冒进上传接口、把一次已经成功的上传变成 500。
+        executor.setRejectedExecutionHandler((task, pool) -> {
+            log.warn("文档索引队列已满，本次不再索引：activeCount={}, queueSize={}",
+                    pool.getActiveCount(), pool.getQueue().size());
+            throw new RejectedExecutionException("文档索引队列已满");
+        });
         // 停机时等在途的索引跑完，否则「重启即失效」会提前到关闭那一刻
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(10);

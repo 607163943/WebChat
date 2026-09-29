@@ -9,13 +9,43 @@ import {
   listConversations,
   listMessages,
 } from '@/api/conversations'
-import { deleteAttachment as deleteAttachmentApi, uploadAttachment } from '@/api/attachments'
+import {
+  deleteAttachment as deleteAttachmentApi,
+  fetchIndexStates,
+  uploadAttachment,
+} from '@/api/attachments'
 import { ApiError } from '@/api/http'
-import type { Attachment, ChatMessage, Conversation, MessageStatus } from '@/api/types'
+import type {
+  Attachment,
+  AttachmentIndexState,
+  ChatMessage,
+  Conversation,
+  MessageStatus,
+} from '@/api/types'
 import type { AttachmentKind } from '@/lib/attachments'
 import { MAX_FILES_PER_MESSAGE, classify, validateFile } from '@/lib/attachments'
 
 const SIDEBAR_KEY = 'webchat:sidebar-collapsed'
+
+/**
+ * 索引状态轮询的节奏，分两段。
+ *
+ * 关心的其实只有一件事：它有没有变成失败。失败要么立刻发生（片段过多、队列满），要么在几秒内
+ * 发生（embedding 调用抛错），所以前 30 秒问得密一些——这段时间正是用户还盯着预览行、
+ * 决定「要不要点发送」的窗口。
+ *
+ * 之后放慢：索引本身可能很久。实测一份 1MB 的纯 ASCII 文本要切 874 段、串行发 88 批，
+ * 跑满两分半——固定 1.5 秒问到底的话，最坏情况下要问一百多次。慢速段把总窗口拉到约 3 分钟，
+ * 与实测的最长索引时长对齐。附件一旦离开输入框（已发送或已移除）就不再被挑中，轮询自然收手。
+ */
+const INDEX_POLL_FAST_INTERVAL = 1500
+const INDEX_POLL_FAST_ATTEMPTS = 20
+const INDEX_POLL_SLOW_INTERVAL = 5000
+const INDEX_POLL_SLOW_ATTEMPTS = 30
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
 /**
  * 正在上传、还没拿到后端附件对象的文件。
@@ -94,6 +124,8 @@ export const useChatStore = defineStore('chat', () => {
   const sidebarCollapsed = ref(readStoredFlag(SIDEBAR_KEY))
 
   let abortController: AbortController | null = null
+  /** 有一条索引轮询正在跑。它每轮都会重新挑一遍未到终态的附件，所以不必并发第二条 */
+  let pollingIndex = false
 
   const currentConversation = computed(
     () => conversations.value.find((item) => item.id === currentId.value) ?? null,
@@ -391,6 +423,72 @@ export const useChatStore = defineStore('chat', () => {
     } finally {
       uploading.value = false
     }
+    // 上传请求结束了，文本附件的索引才刚开始跑：盯着它们，失败的就地撤下来
+    void watchIndexing()
+  }
+
+  /**
+   * 轮询还没到终态的附件。
+   *
+   * 上传成功只说明字节传完了——文本附件此刻刚进索引队列，失败（embedding 抛错、片段过多、
+   * 队列已满）要过一会儿才知道，而用户这会儿多半正看着预览行准备发送。
+   * 轮询把结果收回来，失败的立刻撤下并提示，避免用户把一个读不到内容的文件发出去。
+   */
+  async function watchIndexing(): Promise<void> {
+    if (pollingIndex) {
+      return
+    }
+    pollingIndex = true
+    const attempts = INDEX_POLL_FAST_ATTEMPTS + INDEX_POLL_SLOW_ATTEMPTS
+    try {
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        const watching = attachments.value.filter((item) => item.indexState === 'pending')
+        if (watching.length === 0) {
+          return
+        }
+        await delay(
+          attempt < INDEX_POLL_FAST_ATTEMPTS ? INDEX_POLL_FAST_INTERVAL : INDEX_POLL_SLOW_INTERVAL,
+        )
+        let states: AttachmentIndexState[]
+        try {
+          states = await fetchIndexStates(watching.map((item) => item.id))
+        } catch {
+          // 轮询只是个后台通知，发消息与检索都不依赖它，失败就安静地收手
+          return
+        }
+        applyIndexStates(states)
+      }
+    } finally {
+      pollingIndex = false
+    }
+  }
+
+  /** 把轮询回来的状态并进附件列表；`failed` 是终态，撤下并提示用户重传 */
+  function applyIndexStates(states: AttachmentIndexState[]): void {
+    const byId = new Map(states.map((state) => [state.id, state.indexState]))
+    const failed: Attachment[] = []
+    attachments.value = attachments.value.flatMap((item) => {
+      const next = byId.get(item.id)
+      if (!next || next === item.indexState) {
+        return [item]
+      }
+      if (next === 'failed') {
+        failed.push(item)
+        return []
+      }
+      return [{ ...item, indexState: next }]
+    })
+    if (failed.length === 0) {
+      return
+    }
+    // 后端那行与那个对象也一并撤掉，否则只能等 24 小时的清理任务。失败是终态，
+    // 用户要重传时是一次全新的上传，与这一行无关；万一它已经被随消息发出去了，
+    // 删除会被拒（那是历史，不该被抹掉），静默忽略即可——那种情况下界面上有
+    // MessageAttachments 的失败标记兜着
+    failed.forEach((item) => {
+      void deleteAttachmentApi(item.id).catch(() => {})
+    })
+    errorMessage.value = `${failed.map((item) => `「${item.originalName}」`).join('')}上传失败，已从附件中移除`
   }
 
   /** 移除一个待发送的附件。先本地移除再调接口，失败就放回原位 */

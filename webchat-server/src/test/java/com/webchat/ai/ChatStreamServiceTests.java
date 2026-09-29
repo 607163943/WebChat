@@ -96,7 +96,7 @@ class ChatStreamServiceTests {
             DataSize.ofMegabytes(20), Duration.ofHours(24), Duration.ofMinutes(30), 5);
 
     private final RagProperties ragProperties = new RagProperties(
-            5, 0.7, 1200, 200, 10000, Duration.ofSeconds(3));
+            5, 0.7, 1200, 200, 1000, 10000, Duration.ofSeconds(3));
 
     private final FakeStreamingChatModel model = new FakeStreamingChatModel();
     private final ConversationMemoryStore memoryStore = new ConversationMemoryStore();

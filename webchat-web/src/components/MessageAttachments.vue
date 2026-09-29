@@ -19,9 +19,22 @@ const resolve = resolveAttachmentUrl
 /** 供模板调用：把种类收窄成卡片种类，好去查图标与配色那两张表 */
 const cardKind = cardKindOf
 
+/**
+ * 索引失败的文本附件。
+ *
+ * 正常路径上到不了消息里——失败会在前端轮询发现时就把附件撤下来。它兜的是竞态：
+ * 附件在轮询问到结果之前就被发出去了，此时它已经是消息的一部分，撤不掉，
+ * 但卡片不能还写着「文本文件」，那会让人以为这份文件的内容模型读过。
+ */
+function isFailed(attachment: Attachment): boolean {
+  return attachment.indexState === 'failed'
+}
+
 /** 卡片副标题；图片走缩略图用不到，其余按 MIME 顶层类型给名字 */
 function labelOf(attachment: Attachment): string {
-  return kindLabel(classify(attachment.mimeType) ?? 'image')
+  return isFailed(attachment)
+    ? '处理失败，内容不可用'
+    : kindLabel(classify(attachment.mimeType) ?? 'image')
 }
 </script>
 
@@ -64,7 +77,12 @@ function labelOf(attachment: Attachment): string {
           <span class="text-foreground truncate text-[13px] font-medium">
             {{ attachment.originalName }}
           </span>
-          <span class="text-muted-foreground text-[11.5px]">{{ labelOf(attachment) }}</span>
+          <span
+            class="text-muted-foreground text-[11.5px]"
+            :class="{ 'text-destructive': isFailed(attachment) }"
+          >
+            {{ labelOf(attachment) }}
+          </span>
         </div>
       </div>
     </template>

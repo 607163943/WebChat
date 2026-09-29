@@ -2,10 +2,12 @@ package com.webchat.service.impl;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.webchat.ai.rag.DocumentIndexService;
+import com.webchat.ai.rag.IndexState;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.AttachmentProperties;
 import com.webchat.config.CurrentUserProvider;
+import com.webchat.dto.AttachmentIndexStateVO;
 import com.webchat.dto.AttachmentVO;
 import com.webchat.entity.Attachment;
 import com.webchat.entity.Conversation;
@@ -166,7 +168,20 @@ public class AttachmentServiceImpl implements AttachmentService {
     public Map<Long, List<AttachmentVO>> listByMessageIds(Collection<Long> messageIds) {
         return findByMessageIds(messageIds).stream()
                 .collect(Collectors.groupingBy(Attachment::getMessageId,
-                        Collectors.mapping(AttachmentServiceImpl::toVO, Collectors.toList())));
+                        Collectors.mapping(this::toVO, Collectors.toList())));
+    }
+
+    @Override
+    public List<AttachmentIndexStateVO> indexStates(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return List.of();
+        }
+        // 存在的行才算数：查不到的 id（传错了、已被清理、别人的）直接不出现在结果里，
+        // 调用方按「没回音的就是没有」处理
+        return attachmentMapper.selectExisting(ids, currentUserProvider.userId())
+                .stream()
+                .map(attachment -> new AttachmentIndexStateVO(attachment.getId(), indexStateOf(attachment)))
+                .toList();
     }
 
     @Override
@@ -213,7 +228,7 @@ public class AttachmentServiceImpl implements AttachmentService {
      * 按<b>权威类型</b>选大小上限。
      *
      * <p>文本的阈值比媒体严得多，理由是成本而非安全：文本要切分后逐段调 embedding，
-     * 1MB 中文已约合 35 万 token，而模型的 TPM 是 100 万——一个满额文件就吃掉三分之一的
+     * 1MB 中文已约合 35 万 token，而向量模型的 TPM 是 100 万——一个满额文件就吃掉三分之一的
      * 每分钟配额。图片视频没有这个问题，它们是整块塞进一次请求的。
      */
     private void requireWithinSizeLimit(byte[] content, String mimeType) {
@@ -280,8 +295,22 @@ public class AttachmentServiceImpl implements AttachmentService {
         }
     }
 
-    static AttachmentVO toVO(Attachment attachment) {
+    private AttachmentVO toVO(Attachment attachment) {
         return new AttachmentVO(attachment.getId(), attachment.getOriginalName(),
-                attachment.getUrl(), attachment.getMimeType(), attachment.getFileSize());
+                attachment.getUrl(), attachment.getMimeType(), attachment.getFileSize(),
+                indexStateOf(attachment));
+    }
+
+    /**
+     * 附件的索引状态。
+     *
+     * <p>图片与视频不进向量库，单独给一个 {@code not_indexed}，而不是让它们落进
+     * {@code DocumentIndexService} 的「没有记录」（那会被读成「重启后失效」）：两者对前端是相反的
+     * 指令——not_indexed 是「本来就没有、别等了」，unavailable 是「本该有、现在没了」。
+     */
+    private String indexStateOf(Attachment attachment) {
+        return typePolicy.isText(attachment.getMimeType())
+                ? documentIndexService.stateOf(attachment.getId()).wireName()
+                : IndexState.NOT_INDEXED.wireName();
     }
 }
