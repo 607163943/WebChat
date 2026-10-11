@@ -1,20 +1,11 @@
--- ============================================================
--- WebChat 数据库建表脚本
--- 环境：MySQL 8.0 / InnoDB / utf8mb4
--- ============================================================
-
--- 数据库名未在表设计中约定，此处取项目名 webchat
 CREATE DATABASE IF NOT EXISTS `webchat`
     DEFAULT CHARACTER SET utf8mb4
     COLLATE utf8mb4_general_ci;
 
 USE `webchat`;
 
--- 指定会话字符集为 utf8mb4，确保后续语句中的中文注释按 UTF-8 读取，
--- 避免 mysql 客户端默认 latin1 导致注释乱码
 SET NAMES utf8mb4;
 
--- 会话表：一条记录代表一个会话（对话窗口）
 CREATE TABLE `tb_conversation` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '会话ID',
     `user_id` bigint unsigned NOT NULL COMMENT '所属用户ID，登录功能上线前为固定值',
@@ -25,9 +16,6 @@ CREATE TABLE `tb_conversation` (
     KEY `idx_user_update` (`user_id`, `update_time`)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '会话表';
 
--- 消息表：一条记录代表会话中的一条消息，用户提问与 AI 回复同表，通过 role 区分
--- status 只对助手消息有意义（用户消息恒为 completed）：生成中途失败或被打断时，
--- 半截正文照样落库，靠这一列说明它没写完——否则刷新后它与一条完整回复长得一模一样
 CREATE TABLE `tb_message` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '消息ID',
     `conversation_id` bigint unsigned NOT NULL COMMENT '所属会话ID',
@@ -39,10 +27,6 @@ CREATE TABLE `tb_message` (
     KEY `idx_conversation_id` (`conversation_id`, `id`)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COMMENT = '消息表';
 
--- 附件表：一条记录代表一个已上传的图片 / 视频 / 文本文件
--- message_id 是否为空即附件的绑定状态（为空=待绑定）；清理判定与对象回收见 Obsidian《数据库表设计.md》「五、附件表」
--- 无 type 列：image/video/text 分类由 mime_type 的顶层类型推出，合法性由上传接口的 MIME 白名单保证（同上文「五、附件表」）
--- 文本附件另有一份纯内存的向量副本（不落库、重启即清空），用于提问时检索
 CREATE TABLE `tb_attachment` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT COMMENT '附件ID',
     `user_id` bigint unsigned NOT NULL COMMENT '上传者用户ID',
