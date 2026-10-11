@@ -190,11 +190,27 @@ export const useChatStore = defineStore('chat', () => {
       }
       return true
     } catch (error) {
-      errorMessage.value = messageOf(error)
-      return !(error instanceof ApiError && error.status === 404)
+      const missing = error instanceof ApiError && error.status === 404
+      // 会话不存在时刻意不在这里写文案：怎么收场由调用方决定（它还要看用户是不是
+      // 已经切走了），真要回落时再调 reportMissingConversation
+      if (!missing) {
+        errorMessage.value = messageOf(error)
+      }
+      return !missing
     } finally {
       loadingMessages.value = false
     }
+  }
+
+  /**
+   * 提示「地址里那个会话打不开」。
+   *
+   * 文案里带上 id 是必需的：紧随其后的动作是把地址收回 `/` 并切到新会话草稿态，
+   * 用户一抬头发现自己在另一个界面上、地址也变了，得有一句话把这两件事串起来。
+   * 时机交给调用方——只有真的要回落时才说，等待期间已经切走的那些不该留下这条提醒。
+   */
+  function reportMissingConversation(id: number | string): void {
+    errorMessage.value = `不存在 id 为 ${id} 的会话`
   }
 
   /**
@@ -727,6 +743,7 @@ export const useChatStore = defineStore('chat', () => {
     initialize,
     loadConversations,
     openConversation,
+    reportMissingConversation,
     startConversation,
     removeConversation,
     send,

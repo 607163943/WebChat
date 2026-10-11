@@ -14,24 +14,24 @@ const chat = useChatStore()
  * 从按下回车到本轮回复结束之间为 true。
  *
  * 判断空状态只看 messages 会慢半拍：send() 在还没有会话时要先 await 建会话接口，
- * 乐观插入消息发生在那之后，输入框会愣一个网络往返才开始位移。
- * 这里在收到 send 事件时同步置位，让过渡立刻起步。
+ * 乐观插入消息发生在那之后，输入框会愣一个网络往返才归位。
+ * 这里在收到 send 事件时同步置位，让它当场闪现回底部。
  */
 const sending = ref(false)
 
 /**
  * 是否处于「新会话」空状态。
  *
- * loadingMessages / loadingConversations 两个条件不能省：openConversation 会先把
- * messages 清空再去拉取，少了它们，每次切换会话都会把新会话那套问候语与输入框
- * 位移的动画整个重放一遍。
+ * loadingMessages 不能省：openConversation 会先把 messages 清空再去拉取，少了它，
+ * 每次切换会话都会把新会话那套问候语与输入框归位整个重放一遍。
+ *
+ * loadingConversations 则刻意不参与判断。它只在启动拉侧边栏列表时为 true，与「当前
+ * 这个会话是不是空的」无关；算进来的话，启动那一刻（地址是 /，本来就是个新会话）会先
+ * 按「非空」画一帧——输入框出现在底部，等列表回来再跳到居中，就是启动时输入框自己动了
+ * 一下。第一帧就该是它最终的样子，而不是等一个跟它无关的请求。
  */
 const showEmpty = computed(
-  () =>
-    chat.isConversationEmpty &&
-    !chat.loadingMessages &&
-    !chat.loadingConversations &&
-    !sending.value,
+  () => chat.isConversationEmpty && !chat.loadingMessages && !sending.value,
 )
 
 /**
@@ -49,9 +49,19 @@ function conversationPath(id: number | null): string {
   return id === null ? '/' : `/${id}`
 }
 
-/** 解析地址末段的会话 id；没有这一段、或不是正整数（/foo、/0）都返回 null */
+/** 地址参数的原始文本。可重复参数会给成数组，本路由只有一个末段，取第一项即可 */
+function paramText(raw: string | string[] | undefined): string | undefined {
+  return Array.isArray(raw) ? raw[0] : raw
+}
+
+/**
+ * 解析地址末段的会话 id；没有这一段就是「新会话」草稿态。
+ *
+ * 路由已把末段限定成正整数，这里的检查是第二道：超出安全整数范围的数字（20 位以上）
+ * 长得符合路由、却表达不出一个 id。
+ */
 function parseConversationId(raw: string | string[] | undefined): number | null {
-  const text = Array.isArray(raw) ? raw[0] : raw
+  const text = paramText(raw)
   if (text === undefined || !/^\d+$/.test(text)) {
     return null
   }
@@ -70,17 +80,30 @@ watch(
   async (raw) => {
     const id = parseConversationId(raw)
     if (id === null) {
+      // 没有末段就是「新会话」草稿态；有末段却解析不出 id 的（20 位以上的数字），
+      // 路由认下了它、它却不是一个会话 id，按「打不开」收场
       chat.startConversation()
-      if (raw !== undefined) {
-        // 末段不是有效 id（手输 /foo、过期的旧链接）：收回根路径，别停在打不开的地址上
+      const text = paramText(raw)
+      if (text !== undefined) {
+        chat.reportMissingConversation(text)
+        // 地址得自己收回。上面那句置的是 currentId，而它本来就是 null 时（刷新页面、
+        // 刚从别处回落到这里）不构成变化，不会有人替我们把地址改回去
         await router.replace('/')
       }
       return
     }
     if (!(await chat.openConversation(id))) {
-      // 会话打不开（已删除、不属于当前用户）：这个地址已经作废，回落成新会话。
-      // 地址由下面那个 watcher 顺带收回根路径
-      chat.startConversation()
+      // 会话打不开（已删除、不属于当前用户）：回到「新会话」草稿态并说明是哪个 id 打不开，
+      // 地址由下面那个 watcher 顺带收回 `/`。
+      //
+      // 这一步刻意停在聊天页里做，而不是把整页交给 404：会话存不存在要问过后端才知道，
+      // 而那时聊天页早就画完了——换成 404 等于让用户看着主界面闪一下再被整页换掉。
+      //
+      // 拉取期间用户可能已从侧边栏点了别的会话：那就别再动人家的选择，提醒也一并免了
+      if (route.params.id === raw) {
+        chat.startConversation()
+        chat.reportMissingConversation(id)
+      }
     }
   },
   { immediate: true },
@@ -207,7 +230,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <!-- 消息列表比输入框晚 120ms 出场：输入框先动，列表再淡入跟上，读起来像一次编排 -->
+      <!-- 消息列表比输入框晚 120ms 出场：输入框先就位，列表再淡入跟上，读起来像一次编排 -->
       <Transition
         enter-active-class="transition duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] delay-[120ms] motion-reduce:transition-none"
         enter-from-class="translate-y-2.5 opacity-0"
@@ -227,10 +250,12 @@ onBeforeUnmount(() => {
       </Transition>
 
       <!-- 输入区锚点：始终贴底，空状态时整组上浮到垂直居中（见下方位移公式）。
+           上浮与归位刻意不做过渡：提交时输入框直接闪现到位置，滑动只会让每次发送
+           都慢半拍；附件改变高度时的重新居中同理，瞬间生效反而更跟手。
            pointer-events-none 是必需的——锚点是通栏的，会挡住左右两侧列表的点击 -->
       <div
         ref="composer"
-        class="pointer-events-none absolute inset-x-0 bottom-5 flex flex-col items-center px-4 transition-transform duration-450 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none"
+        class="pointer-events-none absolute inset-x-0 bottom-5 flex flex-col items-center px-4"
         :style="{
           transform: showEmpty
             ? 'translateY(calc((var(--chat-input-h) + 57.6px) / 2 + 20px - 50cqh))'
@@ -238,13 +263,15 @@ onBeforeUnmount(() => {
         }"
       >
         <!-- 问候语不参与布局流，靠绝对定位挂在胶囊上方跟着一起走。
-             若放进流里，它淡出时会把胶囊顶上 57.6px，位移变成两段跳。
+             若放进流里，它出现或消失时会把胶囊顶上 57.6px，位移变成两段跳。
+             淡出也一并去掉：锚点改走闪现后，留着它只会在输入框已经落到底部时
+             还在原地留 150ms 的残影。
 
              位移公式：锚点贴底时其底边在 H-20，空状态下整组垂直居中
              （问候语 33.6 + mb-6 24 + 输入框组实测高度）时底边在 H/2 + 组高/2，
              两者相减即上面那个表达式。组高是量出来的，输入框带上附件后会自动跟着变。 -->
         <p
-          class="text-foreground pointer-events-none absolute bottom-full left-1/2 mb-6 -translate-x-1/2 text-2xl leading-[1.4] font-semibold whitespace-nowrap transition-opacity duration-150 motion-reduce:transition-none"
+          class="text-foreground pointer-events-none absolute bottom-full left-1/2 mb-6 -translate-x-1/2 text-2xl leading-[1.4] font-semibold whitespace-nowrap"
           :class="showEmpty ? 'opacity-100' : 'opacity-0'"
         >
           有什么可以帮你的吗？

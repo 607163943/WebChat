@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.io.IOException;
 
@@ -81,6 +82,20 @@ public class GlobalExceptionHandler {
         log.warn("上传请求缺少必需的部分：{}", e.getRequestPartName());
         return build(HttpStatus.BAD_REQUEST,
                 Result.error(ResultCode.BAD_REQUEST.getCode(), "没有收到文件"));
+    }
+
+    /**
+     * 没有任何 handler 认领这个路径：接口地址写错了，或者访问了根本不存在的路径。
+     *
+     * <p>Spring 6.1 起这类请求抛的是 {@link NoResourceFoundException}（默认的资源处理器找不到
+     * 对应静态资源）。它是 {@link Exception} 的子类，不单独接住就会落进 {@link #handleOther}
+     * 变成 500「服务器内部错误」：前端不过是拼错了一个接口地址，看到的却是「服务器出问题了」，
+     * 日志里还留一条满屏堆栈的 ERROR，把真正的故障盖住。
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<Result<Void>> handleNoResource(NoResourceFoundException e) {
+        log.warn("请求的路径不存在：{} {}", e.getHttpMethod(), e.getResourcePath());
+        return build(HttpStatus.NOT_FOUND, Result.error(ResultCode.NOT_FOUND));
     }
 
     @ExceptionHandler(Exception.class)
