@@ -7,10 +7,6 @@ import com.webchat.entity.Conversation;
 import java.util.List;
 
 public interface ConversationService {
-
-    /** 新建会话时的默认标题；该会话首条用户消息发出后，会被模型生成的标题替换 */
-    String DEFAULT_TITLE = "新对话";
-
     /** 当前用户的全部会话，按最后活跃时间倒序。不分页。 */
     List<ConversationVO> list();
 

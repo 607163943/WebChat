@@ -6,6 +6,7 @@ import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.CurrentUserProvider;
+import com.webchat.constant.ConversationConstant;
 import com.webchat.dto.AttachmentVO;
 import com.webchat.dto.ConversationVO;
 import com.webchat.dto.MessageVO;
@@ -49,7 +50,7 @@ public class ConversationServiceImpl implements ConversationService {
     public ConversationVO create() {
         Conversation conversation = new Conversation();
         conversation.setUserId(currentUserProvider.userId());
-        conversation.setTitle(DEFAULT_TITLE);
+        conversation.setTitle(ConversationConstant.DEFAULT_TITLE);
         conversationMapper.insert(conversation);
 
         // create_time / update_time 由数据库默认值填充，插入后回查一次才有值

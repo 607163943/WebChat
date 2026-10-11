@@ -6,6 +6,7 @@ import com.webchat.ai.rag.RagProperties;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.CurrentUserProvider;
+import com.webchat.constant.ConversationConstant;
 import com.webchat.entity.Attachment;
 import com.webchat.entity.Conversation;
 import com.webchat.entity.Message;
@@ -460,7 +461,7 @@ public class ChatStreamService {
 
         // 标题只在「标题仍是默认值」且「这条是该会话第一条用户消息」时生成。
         // 前半句让「重新生成」不会给已有标题的会话改名，后半句又让它能补上首次生成失败而没写成的标题
-        boolean titleNeeded = ConversationService.DEFAULT_TITLE.equals(conversation.getTitle())
+        boolean titleNeeded = ConversationConstant.DEFAULT_TITLE.equals(conversation.getTitle())
                 && history.stream().noneMatch(message -> ROLE_USER.equals(message.getRole()));
 
         List<Content> question = messageAssembler.renderQuestion(userMessage, userAttachments);
