@@ -1,6 +1,6 @@
 package com.webchat.config;
 
-import com.webchat.service.AttachmentCleanupTask;
+import com.webchat.schedule.AttachmentCleanupTask;
 import com.webchat.storage.AttachmentStorage;
 import com.webchat.storage.LocalAttachmentStorage;
 import org.junit.jupiter.api.DisplayName;

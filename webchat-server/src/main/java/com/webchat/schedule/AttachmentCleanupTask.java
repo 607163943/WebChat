@@ -1,4 +1,4 @@
-package com.webchat.service;
+package com.webchat.schedule;
 
 import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.config.AttachmentProperties;

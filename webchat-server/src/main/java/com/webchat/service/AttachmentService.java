@@ -3,6 +3,7 @@ package com.webchat.service;
 import com.webchat.dto.AttachmentIndexStateVO;
 import com.webchat.dto.AttachmentVO;
 import com.webchat.entity.Attachment;
+import com.webchat.schedule.AttachmentCleanupTask;
 
 import java.util.Collection;
 import java.util.List;

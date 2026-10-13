@@ -1,4 +1,4 @@
-package com.webchat.service;
+package com.webchat.schedule;
 
 import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.config.AttachmentProperties;
@@ -18,14 +18,9 @@ import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 /**
  * 附件清理的单元测试。
