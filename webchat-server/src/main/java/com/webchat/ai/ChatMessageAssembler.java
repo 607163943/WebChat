@@ -3,6 +3,7 @@ package com.webchat.ai;
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.AttachmentProperties;
+import com.webchat.constant.MessageRoleConstant;
 import com.webchat.entity.Attachment;
 import com.webchat.entity.Message;
 import com.webchat.service.AttachmentService;
@@ -41,10 +42,6 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class ChatMessageAssembler {
 
-    private static final String ROLE_USER = "user";
-    private static final String ROLE_ASSISTANT = "assistant";
-    private static final String ROLE_SYSTEM = "system";
-
     /** 白名单保证 mime_type 必然以它、{@code video/} 或 {@code text/} 开头，据此分派 */
     private static final String IMAGE_PREFIX = "image/";
     private static final String TEXT_PREFIX = "text/";
@@ -59,11 +56,12 @@ public class ChatMessageAssembler {
      * 框架会把它追加在记忆已有内容<b>之后</b>，而 system 必须紧跟 user 才安全
      * （DashScope 的适配遇到「system 之后不是 user」会把那条消息静默丢掉）。
      *
-     * @param history            库里该会话的全部消息（升序），不含本轮提问
+     * @param allHistory            库里该会话的全部消息（升序），不含本轮提问
      * @param currentAttachments 本轮附件，用来算还剩多少媒体额度
      */
-    public List<ChatMessage> renderMemory(List<Message> history, List<Attachment> currentAttachments) {
-        List<Message> recent = trimToRecent(history);
+    public List<ChatMessage> renderMemory(List<Message> allHistory, List<Attachment> currentAttachments) {
+        // 获取最近历史消息集合
+        List<Message> recent = trimToRecent(allHistory);
         Map<Long, List<Attachment>> media = pickHistoryMedia(recent, currentAttachments);
 
         List<ChatMessage> messages = new ArrayList<>(recent.size() + 1);
@@ -139,9 +137,9 @@ public class ChatMessageAssembler {
     private ChatMessage toChatMessage(Message message, List<Attachment> attachments) {
         return switch (message.getRole()) {
             // 历史轮次不注入资料：检索结果只对本轮提问有意义，混进历史反而会重复占篇幅
-            case ROLE_USER -> toUserMessage(message, attachments);
-            case ROLE_ASSISTANT -> AiMessage.from(message.getContent());
-            case ROLE_SYSTEM -> SystemMessage.from(message.getContent());
+            case MessageRoleConstant.ROLE_USER -> toUserMessage(message, attachments);
+            case MessageRoleConstant.ROLE_ASSISTANT -> AiMessage.from(message.getContent());
+            case MessageRoleConstant.ROLE_SYSTEM -> SystemMessage.from(message.getContent());
             default -> throw new IllegalStateException("未知的消息角色：" + message.getRole());
         };
     }
@@ -190,7 +188,7 @@ public class ChatMessageAssembler {
         // 从最新的一条往前取
         for (int index = recentHistory.size() - 1; index >= 0; index--) {
             Message message = recentHistory.get(index);
-            if (!ROLE_USER.equals(message.getRole())) {
+            if (!MessageRoleConstant.ROLE_USER.equals(message.getRole())) {
                 continue;
             }
             for (Attachment attachment : byMessage.getOrDefault(message.getId(), List.of())) {
@@ -253,13 +251,18 @@ public class ChatMessageAssembler {
                 .collect(Collectors.joining());
     }
 
-    private static List<Message> trimToRecent(List<Message> history) {
-        int size = history.size();
+    /**
+     * 获取最近的历史消息集合
+     * @param allHistory 库里该会话的全部消息（升序），不含本轮提问
+     * @return 最近的历史消息集合
+     */
+    private static List<Message> trimToRecent(List<Message> allHistory) {
+        int size = allHistory.size();
         if (size <= Prompt.MAX_HISTORY_MESSAGES) {
-            return history;
+            return allHistory;
         }
         // 附件预算在这个裁剪结果上算，否则会为随后被裁掉的消息白读一遍磁盘
-        return history.subList(size - Prompt.MAX_HISTORY_MESSAGES, size);
+        return allHistory.subList(size - Prompt.MAX_HISTORY_MESSAGES, size);
     }
 
     private static long totalBytes(List<Attachment> attachments) {

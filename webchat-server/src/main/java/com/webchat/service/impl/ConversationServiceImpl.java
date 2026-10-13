@@ -76,9 +76,7 @@ public class ConversationServiceImpl implements ConversationService {
         documentIndexService.forgetAll(attachmentService.listTextAttachmentIds(id));
         messageMapper.delete(Wrappers.<Message>lambdaQuery().eq(Message::getConversationId, id));
         conversationMapper.deleteById(id);
-        // 对应的记忆槽位也清掉。消息都删了，槽位里那份渲染结果不该留在堆里——
-        // 下一条消息若带着同一个 id 进来（自增 id 不会复用，但别把这件事寄托在它上面），
-        // 也用不上它：记忆每轮都由 prepare 重建
+        // 清理会话记忆中该会话相关的记忆
         memoryStore.deleteMessages(id);
     }
 

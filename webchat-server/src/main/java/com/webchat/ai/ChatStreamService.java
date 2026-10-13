@@ -7,6 +7,7 @@ import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
 import com.webchat.config.CurrentUserProvider;
 import com.webchat.constant.ConversationConstant;
+import com.webchat.constant.MessageRoleConstant;
 import com.webchat.entity.Attachment;
 import com.webchat.entity.Conversation;
 import com.webchat.entity.Message;
@@ -48,10 +49,6 @@ import java.util.List;
 @Service
 @RequiredArgsConstructor
 public class ChatStreamService {
-
-    private static final String ROLE_USER = "user";
-    private static final String ROLE_ASSISTANT = "assistant";
-
     private final ChatAssistant chatAssistant;
     private final ConversationMemoryStore memoryStore;
     private final ChatMessageAssembler messageAssembler;
@@ -90,11 +87,11 @@ public class ChatStreamService {
         }
 
         // 先取历史再插入，这样历史里不含本条，正好用来判断「是不是首条用户消息」
-        List<Message> history = selectMessages(conversationId);
+        List<Message> allHistory = selectMessages(conversationId);
 
         Message userMessage = new Message();
         userMessage.setConversationId(conversationId);
-        userMessage.setRole(ROLE_USER);
+        userMessage.setRole(MessageRoleConstant.ROLE_USER);
         userMessage.setContent(content);
         messageMapper.insert(userMessage);
         conversationMapper.touch(conversationId, userId);
@@ -102,7 +99,7 @@ public class ChatStreamService {
         // 校验归属、未绑定、未过期，并回填 conversation_id
         attachmentService.bindToMessage(ids, userMessage.getId(), conversationId);
 
-        return buildContext(conversation, userId, history, userMessage,
+        return buildContext(conversation, userId, allHistory, userMessage,
                 attachmentService.findByMessageId(userMessage.getId()), null);
     }
 
@@ -124,13 +121,13 @@ public class ChatStreamService {
 
         Long existingReplyId = null;
         int lastIndex = messages.size() - 1;
-        if (lastIndex >= 0 && ROLE_ASSISTANT.equals(messages.get(lastIndex).getRole())) {
+        if (lastIndex >= 0 && MessageRoleConstant.ROLE_ASSISTANT.equals(messages.get(lastIndex).getRole())) {
             existingReplyId = messages.get(lastIndex).getId();
             // 只是从上下文里摘掉：它是本轮要覆盖的对象，不该作为历史发给模型。
             // 尾条不是助手回复时（首轮提问后重生成）保持 null，本轮新写一条
             messages.remove(lastIndex);
         }
-        if (messages.isEmpty() || !ROLE_USER.equals(messages.get(messages.size() - 1).getRole())) {
+        if (messages.isEmpty() || !MessageRoleConstant.ROLE_USER.equals(messages.get(messages.size() - 1).getRole())) {
             throw new BizException(ResultCode.BAD_REQUEST, "没有可重新生成的提问");
         }
 
@@ -309,7 +306,7 @@ public class ChatStreamService {
             if (context.existingReplyId() == null) {
                 Message reply = new Message();
                 reply.setConversationId(context.conversationId());
-                reply.setRole(ROLE_ASSISTANT);
+                reply.setRole(MessageRoleConstant.ROLE_ASSISTANT);
                 reply.setContent(text);
                 reply.setStatus(status);
                 messageMapper.insert(reply);
@@ -451,18 +448,18 @@ public class ChatStreamService {
      * 每轮重算（见 {@link ChatMessageAssembler}）。灌进去的那一批里，最后一条必然是助手回复或用户消息，
      * 本轮提问随后由框架追加在它之后。
      *
-     * @param history 本轮之前的历史；不含本轮提问，重生成时也不含那条要被覆盖的旧回复
+     * @param allHistory 本轮之前的历史；不含本轮提问，重生成时也不含那条要被覆盖的旧回复
      */
-    private ChatContext buildContext(Conversation conversation, long userId, List<Message> history,
+    private ChatContext buildContext(Conversation conversation, long userId, List<Message> allHistory,
                                      Message userMessage, List<Attachment> userAttachments,
                                      Long existingReplyId) {
         memoryStore.seed(conversation.getId(),
-                messageAssembler.renderMemory(history, userAttachments));
+                messageAssembler.renderMemory(allHistory, userAttachments));
 
         // 标题只在「标题仍是默认值」且「这条是该会话第一条用户消息」时生成。
         // 前半句让「重新生成」不会给已有标题的会话改名，后半句又让它能补上首次生成失败而没写成的标题
         boolean titleNeeded = ConversationConstant.DEFAULT_TITLE.equals(conversation.getTitle())
-                && history.stream().noneMatch(message -> ROLE_USER.equals(message.getRole()));
+                && allHistory.stream().noneMatch(message -> MessageRoleConstant.ROLE_USER.equals(message.getRole()));
 
         List<Content> question = messageAssembler.renderQuestion(userMessage, userAttachments);
         return new ChatContext(
