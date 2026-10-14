@@ -36,10 +36,13 @@ public record AttachmentProperties(
         @DefaultValue("5") int maxFilesPerMessage,
 
         /**
-         * 整轮请求发给模型的媒体总量上限（base64 编码前）。
+         * 单条消息随请求发给模型的媒体总量上限（base64 编码前），在附件绑定那一刻校验。
          *
          * <p>只限个数是不够的：5 个 10MB 的文件 base64 之后是 ~67MB 的请求体，
          * 所以还要有一道按字节算的闸。
+         *
+         * <p>历史不带媒体（见 {@code ChatMessageAssembler}），所以「单条消息」与「整轮请求」
+         * 是同一件事：发出去的媒体只有本轮提问带来的那一批。
          */
         @DefaultValue("20MB") DataSize maxRequestMediaSize,
 

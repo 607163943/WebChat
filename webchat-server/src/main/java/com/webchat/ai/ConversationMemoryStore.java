@@ -30,7 +30,7 @@ public class ConversationMemoryStore implements ChatMemoryStore {
     /**
      * 用这一轮的上下文覆盖整个槽位。
      *
-     * <p>放进去的是<b>已经渲染好的</b>消息（含历史附件说明与按预算挑好的媒体），
+     * <p>放进去的是<b>已经渲染好的</b>消息（含历史里文本附件的说明行，但不含媒体），
      * 不是库里的行——渲染按轮进行，见 {@link ChatMessageAssembler#renderMemory}。
      */
     public void seed(Object memoryId, List<ChatMessage> messages) {

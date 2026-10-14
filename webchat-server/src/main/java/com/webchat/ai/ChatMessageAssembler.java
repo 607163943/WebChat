@@ -2,7 +2,6 @@ package com.webchat.ai;
 
 import com.webchat.common.BizException;
 import com.webchat.common.ResultCode;
-import com.webchat.config.AttachmentProperties;
 import com.webchat.constant.MessageRoleConstant;
 import com.webchat.entity.Attachment;
 import com.webchat.entity.Message;
@@ -29,10 +28,14 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
- * 库里的消息行 → 发给模型的消息：历史（含附件）与本轮提问的内容。
+ * 库里的消息行 → 发给模型的消息：历史与本轮提问的内容。
  *
- * <p>历史<b>每轮重新渲染</b>，不缓存中间结果：媒体预算要按「本轮提问占掉多少额度」重算，
- * 缓存下来就只能沿用上一轮挑好的那批。
+ * <p><b>媒体（图片／视频）只跟着本轮提问走，历史里一概不带 base64</b>：历史每轮都要整份重发，
+ * 带上媒体就等于此后每一轮都把此前所有图片的 base64 再传一次，成本随轮次线性上涨。
+ * 模型对早先图片的了解改由会话记忆承担——它当时回复里对画面的描述就在历史文本中
+ * （系统提示词要求它收到图片时先说明看到了什么）。历史里只留文本：消息正文，
+ * 以及每个附件一行说明（「用户上传了图片：x.png」这类，不读文件、不占额度）。
+ * 那一行不是可有可无的：只发附件不打字的那一轮，正文是空串，少了它就是一条空的用户消息。
  *
  * <p>渲染出来的两条产物去向不同：历史进 {@link ConversationMemoryStore}（每轮覆盖），
  * 本轮提问作为 {@code ChatAssistant} 的实参直接发出去。
@@ -47,27 +50,24 @@ public class ChatMessageAssembler {
     private static final String TEXT_PREFIX = "text/";
 
     private final AttachmentService attachmentService;
-    private final AttachmentProperties attachmentProperties;
 
     /**
-     * 渲染该会话的记忆：系统提示词打头，随后是最近若干条历史（媒体按预算挑）。
+     * 渲染该会话的记忆：系统提示词打头，随后是最近若干条历史（只含文本）。
      *
      * <p>系统提示词由这里放，而不是让 {@code ChatAssistant} 用 {@code @SystemMessage} 声明：
      * 框架会把它追加在记忆已有内容<b>之后</b>，而 system 必须紧跟 user 才安全
      * （DashScope 的适配遇到「system 之后不是 user」会把那条消息静默丢掉）。
      *
-     * @param allHistory            库里该会话的全部消息（升序），不含本轮提问
-     * @param currentAttachments 本轮附件，用来算还剩多少媒体额度
+     * @param allHistory 库里该会话的全部消息（升序），不含本轮提问
      */
-    public List<ChatMessage> renderMemory(List<Message> allHistory, List<Attachment> currentAttachments) {
-        // 获取最近历史消息集合
+    public List<ChatMessage> renderMemory(List<Message> allHistory) {
         List<Message> recent = trimToRecent(allHistory);
-        Map<Long, List<Attachment>> media = pickHistoryMedia(recent, currentAttachments);
+        Map<Long, List<Attachment>> attachments = pickHistoryAttachments(recent);
 
         List<ChatMessage> messages = new ArrayList<>(recent.size() + 1);
         messages.add(SystemMessage.from(Prompt.SYSTEM_PROMPT));
         for (Message message : recent) {
-            messages.add(toChatMessage(message, media.getOrDefault(message.getId(), List.of())));
+            messages.add(toChatMessage(message, attachments.getOrDefault(message.getId(), List.of())));
         }
         return List.copyOf(messages);
     }
@@ -83,33 +83,37 @@ public class ChatMessageAssembler {
      *                      异常会把整个 prepare 事务回滚，空消息不会留下
      */
     public List<Content> renderQuestion(Message message, List<Attachment> attachments) {
-        List<Content> contents = contentsOf(message, attachments);
-        if (contents.isEmpty()) {
-            // 有附件却一个都没读出来（对象已被清理之类）
-            throw new BizException(ResultCode.BAD_REQUEST, "附件内容已不可用，请重新上传");
-        }
-        return contents;
-    }
-
-    /** 正文 + 文本附件说明 + 挑中的媒体；一段都没有时返回空列表，由调用方决定是拦下还是将就 */
-    private List<Content> contentsOf(Message message, List<Attachment> attachments) {
-        List<Content> contents = new ArrayList<>();
-        String text = message.getContent();
-        if (text != null && !text.isBlank()) {
-            contents.add(TextContent.from(text));
-        }
-        // 文本附件本身不作为多模态内容发出去（内容走检索），但必须留下一行说明它是哪个文件，
-        // 否则「只带附件、没有文字」的那一轮会得到一份空的 contents
-        List<Attachment> documents = attachments.stream().filter(ChatMessageAssembler::isDocument).toList();
-        if (!documents.isEmpty()) {
-            contents.add(TextContent.from(documentNote(documents)));
-        }
+        List<Content> contents = new ArrayList<>(textContentsOf(message, attachments));
         attachments.stream()
                 .filter(attachment -> !isDocument(attachment))
                 .map(this::toMediaContent)
                 .flatMap(Optional::stream)
                 .forEach(contents::add);
+        if (contents.isEmpty()) {
+            // 有附件却一个都没读出来（对象已被清理之类）
+            throw new BizException(ResultCode.BAD_REQUEST, "附件内容已不可用，请重新上传");
+        }
         return List.copyOf(contents);
+    }
+
+    /**
+     * 正文 + 文本附件说明：本轮提问与历史共用的那部分，不含媒体本身。
+     *
+     * <p>文本附件在任何地方都只有这一行说明（内容走检索）。媒体则看用在哪儿：本轮提问里它由
+     * {@link #renderQuestion} 作为 base64 追加在后面，历史里由 {@link #toHistoryUserMessage}
+     * 补一行字。两边都得有东西，否则「只带附件、没有文字」的那一轮会得到一份空的内容。
+     */
+    private List<Content> textContentsOf(Message message, List<Attachment> attachments) {
+        List<Content> contents = new ArrayList<>();
+        String text = message.getContent();
+        if (text != null && !text.isBlank()) {
+            contents.add(TextContent.from(text));
+        }
+        List<Attachment> documents = attachments.stream().filter(ChatMessageAssembler::isDocument).toList();
+        if (!documents.isEmpty()) {
+            contents.add(TextContent.from(documentNote(documents)));
+        }
+        return contents;
     }
 
     /**
@@ -137,7 +141,7 @@ public class ChatMessageAssembler {
     private ChatMessage toChatMessage(Message message, List<Attachment> attachments) {
         return switch (message.getRole()) {
             // 历史轮次不注入资料：检索结果只对本轮提问有意义，混进历史反而会重复占篇幅
-            case MessageRoleConstant.ROLE_USER -> toUserMessage(message, attachments);
+            case MessageRoleConstant.ROLE_USER -> toHistoryUserMessage(message, attachments);
             case MessageRoleConstant.ROLE_ASSISTANT -> AiMessage.from(message.getContent());
             case MessageRoleConstant.ROLE_SYSTEM -> SystemMessage.from(message.getContent());
             default -> throw new IllegalStateException("未知的消息角色：" + message.getRole());
@@ -145,71 +149,42 @@ public class ChatMessageAssembler {
     }
 
     /**
-     * 历史里的用户消息。
+     * 历史里的用户消息：正文 + 每个附件一行的说明，<b>不带媒体本身</b>（原因见类注释）。
      *
-     * <p>与 {@link #renderQuestion} 的区别是<b>不拦空内容</b>：历史是既成事实，
+     * <p>媒体那一行（「用户上传了图片：x.png」）不能省：只发图片不打字的那一轮，正文是空串，
+     * 少了它就是一条空的用户消息——而 {@code qwen3.8-max} 走的是多模态端点，空文本会被原样发出去。
+     * 有了这一行，模型也知道那条消息配过图，与它自己当时写下的描述互相印证。
+     *
+     * <p>与 {@link #renderQuestion} 的区别之一是<b>不拦空内容</b>：历史是既成事实，
      * 一条正文为空、附件又已被回收的旧消息不该把整轮对话变成 400——当初它就是那样发出去的。
      */
-    private UserMessage toUserMessage(Message message, List<Attachment> attachments) {
-        List<Content> contents = contentsOf(message, attachments);
+    private UserMessage toHistoryUserMessage(Message message, List<Attachment> attachments) {
+        List<Content> contents = new ArrayList<>(textContentsOf(message, attachments));
+        List<Attachment> media = attachments.stream().filter(attachment -> !isDocument(attachment)).toList();
+        if (!media.isEmpty()) {
+            contents.add(TextContent.from(mediaNote(media)));
+        }
         return contents.isEmpty()
                 ? UserMessage.from("")
                 : UserMessage.builder().contents(contents).build();
     }
 
     /**
-     * 挑出历史里还要发给模型的附件。
+     * 取出历史消息的附件行，按消息分组——<b>只为了渲染说明行</b>，不读文件、不做预算。
      *
-     * <p><b>媒体</b>（图片／视频）受预算约束：整轮请求的数量不超过单条消息的上限、字节数不超过配置的
-     * 上限，本轮提问的附件优先占额度，剩下的从最近的历史消息往前补——最新那批正是用户刚发上去、
-     * 语义上也最相关的，更早的只发文本。没有这道闸，20 条历史 × 5 个文件会把请求撑爆。
-     *
-     * <p><b>文本附件不受预算约束、也不占额度</b>：它的内容不进请求体（走检索），带上它只是为了在历史
-     * 那条消息里渲染出一行「用户上传了文件：x.txt」。这一行不能省——那条消息的正文可能是空串
-     * （只传文件没打字），少了它就成了一条内容为空的用户消息。
+     * <p>于是「本轮优先、从最近往前补」那套额度分配整体消失了：媒体不再重发，本轮附件一律全发，
+     * 个数与总量在绑定那一步就已经把关（见 {@code AttachmentService#bindToMessage}）。
      */
-    private Map<Long, List<Attachment>> pickHistoryMedia(List<Message> recentHistory,
-                                                         List<Attachment> currentAttachments) {
-        if (recentHistory.isEmpty()) {
-            return Map.of();
-        }
-        List<Attachment> currentMedia = currentAttachments.stream().filter(a -> !isDocument(a)).toList();
-        long remainingCount = attachmentProperties.maxFilesPerMessage() - currentMedia.size();
-        long remainingBytes = attachmentProperties.maxRequestMediaSize().toBytes() - totalBytes(currentMedia);
-
+    private Map<Long, List<Attachment>> pickHistoryAttachments(List<Message> recentHistory) {
         List<Long> historyIds = recentHistory.stream().map(Message::getId).toList();
-        Map<Long, List<Attachment>> byMessage = attachmentService.findByMessageIds(historyIds).stream()
+        return attachmentService.findByMessageIds(historyIds).stream()
                 .collect(Collectors.groupingBy(Attachment::getMessageId,
                         LinkedHashMap::new, Collectors.toList()));
-
-        Map<Long, List<Attachment>> picked = new LinkedHashMap<>();
-        long count = 0;
-        long bytes = 0;
-        // 从最新的一条往前取
-        for (int index = recentHistory.size() - 1; index >= 0; index--) {
-            Message message = recentHistory.get(index);
-            if (!MessageRoleConstant.ROLE_USER.equals(message.getRole())) {
-                continue;
-            }
-            for (Attachment attachment : byMessage.getOrDefault(message.getId(), List.of())) {
-                if (isDocument(attachment)) {
-                    picked.computeIfAbsent(message.getId(), key -> new ArrayList<>()).add(attachment);
-                    continue;
-                }
-                if (count >= remainingCount || bytes + sizeOf(attachment) > remainingBytes) {
-                    // 媒体额度用完就不再带更早的媒体，但循环要继续——后面的文本附件还得收进来说明文件
-                    continue;
-                }
-                picked.computeIfAbsent(message.getId(), key -> new ArrayList<>()).add(attachment);
-                count++;
-                bytes += sizeOf(attachment);
-            }
-        }
-        return picked;
     }
 
     /**
-     * 组装媒体内容。带附件时走多模态：文字与媒体各自是一个 content，媒体一律用 base64。
+     * 组装媒体内容，<b>只用于本轮提问</b>。带附件时走多模态：文字与媒体各自是一个 content，
+     * 媒体一律用 base64。
      *
      * <p>用 base64 而不是 URL，是因为开发环境的后端跑在内网（192.168.150.101），
      * 模型侧根本拉不到那个地址；LangChain4j 的 DashScope 适配会把 base64 拼成
@@ -232,7 +207,7 @@ public class ChatMessageAssembler {
                     ? ImageContent.from(base64, mimeType)
                     : VideoContent.from(base64, mimeType));
         } catch (AttachmentStorageException e) {
-            // 历史附件读不出来就跳过这一段，不值得让整轮对话失败
+            // 附件读不出来就跳过这一段，不值得让整轮对话失败
             log.warn("附件内容读取失败，本轮跳过：id={}, objectKey={}",
                     attachment.getId(), attachment.getObjectKey(), e);
             return Optional.empty();
@@ -251,6 +226,20 @@ public class ChatMessageAssembler {
                 .collect(Collectors.joining());
     }
 
+    /** 历史里媒体的说明行。只报类型与文件名，内容一概不带——图片与视频本身就是被去掉的那部分 */
+    private static String mediaNote(List<Attachment> media) {
+        return media.stream()
+                .map(attachment -> "（用户上传了" + mediaKindOf(attachment) + "："
+                        + attachment.getOriginalName() + "）")
+                .collect(Collectors.joining());
+    }
+
+    /** 白名单下媒体只有图片与视频两类，顶层类型即可分辨 */
+    private static String mediaKindOf(Attachment attachment) {
+        String mimeType = attachment.getMimeType();
+        return mimeType != null && mimeType.startsWith(IMAGE_PREFIX) ? "图片" : "视频";
+    }
+
     /**
      * 获取最近的历史消息集合
      * @param allHistory 库里该会话的全部消息（升序），不含本轮提问
@@ -261,15 +250,7 @@ public class ChatMessageAssembler {
         if (size <= Prompt.MAX_HISTORY_MESSAGES) {
             return allHistory;
         }
-        // 附件预算在这个裁剪结果上算，否则会为随后被裁掉的消息白读一遍磁盘
+        // 附件说明只在这个裁剪结果上取，否则会为随后被裁掉的消息白查一遍库
         return allHistory.subList(size - Prompt.MAX_HISTORY_MESSAGES, size);
-    }
-
-    private static long totalBytes(List<Attachment> attachments) {
-        return attachments.stream().mapToLong(ChatMessageAssembler::sizeOf).sum();
-    }
-
-    private static long sizeOf(Attachment attachment) {
-        return attachment.getFileSize() == null ? 0L : attachment.getFileSize();
     }
 }

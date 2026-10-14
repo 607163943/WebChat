@@ -4,7 +4,6 @@ import com.baomidou.mybatisplus.core.conditions.Wrapper;
 import com.webchat.ai.rag.DocumentIndexService;
 import com.webchat.ai.rag.RagProperties;
 import com.webchat.common.BizException;
-import com.webchat.config.AttachmentProperties;
 import com.webchat.config.CurrentUserProvider;
 import com.webchat.entity.Attachment;
 import com.webchat.entity.Conversation;
@@ -33,7 +32,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.util.unit.DataSize;
 import reactor.core.Disposable;
 
 import java.time.Duration;
@@ -45,6 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -91,10 +90,6 @@ class ChatStreamServiceTests {
     private DocumentIndexService documentIndexService;
 
     /** 直接用 record 构造，无需启动 Spring 上下文 */
-    private final AttachmentProperties attachmentProperties = new AttachmentProperties(
-            "./data/attachments", DataSize.ofMegabytes(10), DataSize.ofMegabytes(1), 5,
-            DataSize.ofMegabytes(20), Duration.ofHours(24), Duration.ofMinutes(30), 5);
-
     private final RagProperties ragProperties = new RagProperties(
             5, 0.7, 1200, 200, 1000, 10000, Duration.ofSeconds(3));
 
@@ -107,7 +102,7 @@ class ChatStreamServiceTests {
     void setUp() {
         // 与 AssistantConfig 用同一处装配：记忆与消息组装都走真的框架实现，测试才说明得了问题。
         // 装配写在 setUp 里而不是字段初始化里——@Mock 的字段要到这时才被注入
-        messageAssembler = new ChatMessageAssembler(attachmentService, attachmentProperties);
+        messageAssembler = new ChatMessageAssembler(attachmentService);
         // 第三个参数是工具提供者：null 即「这一轮模型手上没有工具」，多数用例与联网搜索无关
         installService(new AssistantConfig().chatAssistant(model, memoryStore, null));
         // 检索默认返回「没有资料」：多数用例测的是事件编排，与 RAG 无关。
@@ -842,15 +837,15 @@ class ChatStreamServiceTests {
         assertThat(events).noneMatch(ChatEvent.Failed.class::isInstance);
     }
 
-    // ---------------------------------------------------------------- 附件的媒体预算
+    // ---------------------------------------------------------------- 历史里的附件
 
     @Test
-    @DisplayName("媒体额度用完时，历史里的文本附件仍要带上：它是那轮消息唯一的说明")
-    void keepsHistoryDocumentsEvenWhenMediaBudgetIsExhausted() {
+    @DisplayName("历史只留每个附件各一行的说明，图片与视频一概不再重发")
+    void keepsHistoryNotesButNeverMedia() {
         Message historyUser = userMessage("上一轮");
         historyUser.setId(5L);
         prepareSucceeds(9L, List.of(historyUser));
-        // 本条消息就把 5 个媒体的额度占满
+        // 本轮把 5 个媒体的额度占满
         List<Attachment> current = List.of(
                 attachment(200L, "image/png", 1), attachment(201L, "image/png", 1),
                 attachment(202L, "image/png", 1), attachment(203L, "image/png", 1),
@@ -859,36 +854,50 @@ class ChatStreamServiceTests {
         current.forEach(item -> when(attachmentService.readContent(item)).thenReturn(new byte[]{1}));
 
         Attachment historyImage = attachment(300L, "image/png", 1, 5L);
+        Attachment historyVideo = attachment(302L, "video/mp4", 1, 5L);
         Attachment historyDocument = attachment(301L, "text/plain", 1, 5L);
         when(attachmentService.findByMessageIds(List.of(5L)))
-                .thenReturn(List.of(historyImage, historyDocument));
+                .thenReturn(List.of(historyImage, historyVideo, historyDocument));
         model.emits("好");
 
         collect(service.prepare(CONVERSATION_ID, "都看看吧", List.of()));
 
         // 请求 = 系统提示词 + 历史 + 本轮提问，历史那条在第 2 位
-        UserMessage historySent = (UserMessage) sentMessages().get(1);
-        assertThat(historySent.contents())
-                .as("媒体超预算被裁掉，文本附件的说明必须留下")
+        String historyText = textOf((UserMessage) sentMessages().get(1));
+        assertThat(historyText)
+                .as("历史里每个附件各留一行说明：文本附件报文件名，媒体报类型与文件名")
+                .contains("用户上传了文件：附件-301")
+                .contains("用户上传了图片：附件-300")
+                .contains("用户上传了视频：附件-302");
+        assertThat(((UserMessage) sentMessages().get(1)).contents())
+                .as("base64 一个都不再进历史")
                 .noneMatch(ImageContent.class::isInstance)
-                .anyMatch(content -> content instanceof TextContent text
-                        && text.text().contains("附件-301"));
+                .noneMatch(VideoContent.class::isInstance);
     }
 
     @Test
-    @DisplayName("历史里的媒体在预算内时照常带上：最新那批优先")
-    void keepsHistoryMediaWithinBudget() {
-        Message historyUser = userMessage("上一轮");
+    @DisplayName("只发图片不打字的那一轮：历史里留下说明行，而不是一条空的用户消息")
+    void neverLeavesAnEmptyHistoryMessage() {
+        Message historyUser = userMessage("");
         historyUser.setId(5L);
         prepareSucceeds(9L, List.of(historyUser));
         Attachment historyImage = attachment(300L, "image/png", 1, 5L);
         when(attachmentService.findByMessageIds(List.of(5L))).thenReturn(List.of(historyImage));
-        when(attachmentService.readContent(historyImage)).thenReturn(new byte[]{7});
         model.emits("好");
 
         collect(service.prepare(CONVERSATION_ID, "接着看", List.of()));
 
-        UserMessage historySent = (UserMessage) sentMessages().get(1);
-        assertThat(historySent.contents()).anyMatch(ImageContent.class::isInstance);
+        // 空文本会被原样发到 DashScope 的多模态端点，这一行说明既填上了它，也让模型知道那轮传过图
+        assertThat(textOf((UserMessage) sentMessages().get(1))).contains("用户上传了图片：附件-300");
+        // 媒体不重发，也就连盘都不该读
+        verify(attachmentService, never()).readContent(historyImage);
+    }
+
+    /** 一条用户消息里的全部文本，按行拼起来，便于整体断言 */
+    private static String textOf(UserMessage message) {
+        return message.contents().stream()
+                .filter(TextContent.class::isInstance)
+                .map(content -> ((TextContent) content).text())
+                .collect(Collectors.joining("\n"));
     }
 }

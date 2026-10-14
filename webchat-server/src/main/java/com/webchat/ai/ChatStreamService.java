@@ -444,8 +444,8 @@ public class ChatStreamService {
      * 组装本轮上下文，并把系统提示词与历史灌进该会话的记忆槽位。
      *
      * <p><b>记忆每轮重建</b>，而不是首轮灌一次、之后增量维护：库是唯一真源，这样中断／失败落库的半截回复、
-     * 重启、切会话、重新生成都不会让「模型看到的」与「库里记着的」分叉；历史附件的媒体预算也才谈得上
-     * 每轮重算（见 {@link ChatMessageAssembler}）。灌进去的那一批里，最后一条必然是助手回复或用户消息，
+     * 重启、切会话、重新生成都不会让「模型看到的」与「库里记着的」分叉；本轮提问的媒体也才谈得上
+     * 逐轮重取（见 {@link ChatMessageAssembler}）。灌进去的那一批里，最后一条必然是助手回复或用户消息，
      * 本轮提问随后由框架追加在它之后。
      *
      * @param allHistory 本轮之前的历史；不含本轮提问，重生成时也不含那条要被覆盖的旧回复
@@ -453,8 +453,7 @@ public class ChatStreamService {
     private ChatContext buildContext(Conversation conversation, long userId, List<Message> allHistory,
                                      Message userMessage, List<Attachment> userAttachments,
                                      Long existingReplyId) {
-        memoryStore.seed(conversation.getId(),
-                messageAssembler.renderMemory(allHistory, userAttachments));
+        memoryStore.seed(conversation.getId(), messageAssembler.renderMemory(allHistory));
 
         // 标题只在「标题仍是默认值」且「这条是该会话第一条用户消息」时生成。
         // 前半句让「重新生成」不会给已有标题的会话改名，后半句又让它能补上首次生成失败而没写成的标题
